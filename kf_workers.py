@@ -583,7 +583,7 @@ class KF_SensorFusion:
         K_next = np.dot(np.dot(P_next, H.T), np.linalg.inv(intermediate_matrix))
         return K_next
 
-    def run_kalman_filter(self):
+    def run_kalman_filter(self, start_idx, end_idx):
         """Run the Kalman Filter to fuse IMU and GPS data for pose estimation."""
         # Initial state [x, y, z, roll, pitch, yaw, v_x, v_y, v_z, angular_x, angular_y, angular_z, a_x, a_y, a_z]
         xt = np.array([0, 0, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0,    0, 0, 0])
@@ -609,9 +609,9 @@ class KF_SensorFusion:
         I = np.eye(15)
 
         # Create a list to store the state (X, Y, Z, roll, pitch, yaw)
-        sf_KF_state = [(xt[0], xt[1], xt[2], xt[3], xt[4], xt[5])]  # Storing initial state
+        sf_KF_state = [(0, xt[0], xt[1], xt[2], xt[3], xt[4], xt[5])]  # Storing initial state
         gps_started = False  
-        for i, (index, sensor_type, time, sensor_data) in tqdm(enumerate(self.indexed_sensor_data)):
+        for i, (index, sensor_type, time, sensor_data) in tqdm(enumerate(self.indexed_sensor_data[start_idx:end_idx])):
             # # Start processing only when the first GPS data is encountered
             if sensor_type == 'GPS' and not gps_started:
                 gps_started = True
@@ -665,7 +665,7 @@ class KF_SensorFusion:
                 xt = xt + np.dot(Kt, y)
                 Pt = np.dot(I - np.dot(Kt, H_IMU), Pt)
 
-            sf_KF_state.append((xt[0], xt[1], xt[2], xt[3], xt[4], xt[5]))  # Append updated state (X, Y, Z, Roll, Pitch, Yaw)
+            sf_KF_state.append((time, xt[0], xt[1], xt[2], xt[3], xt[4], xt[5]))  # Append updated state (X, Y, Z, Roll, Pitch, Yaw)
             previous_time = time  # Update previous time
         return sf_KF_state
 
@@ -901,27 +901,31 @@ class KF_SensorFusion:
         num_workers = multiprocessing.cpu_count()
         with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
             futures = []
+            chunk_list = []
             while True:
                 chunk = list(islice(combos, chunk_size))
                 if not chunk:
                     break
                 futures.append(executor.submit(evaluate_combo_chunk_worker, chunk, xt, Pt, class_args))
-            for future in concurrent.futures.as_completed(futures):
-                results = future.result()
-                for metric, traj, combo, xt_bf, Pt_bf in results:
-                    if metric is not None and metric < best_metric:
-                        best_metric = metric
-                        best_trajectory = traj
-                        best_sensors = combo
-                        best_state = xt_bf
-                        best_cov = Pt_bf
-                processed += len(chunk)
-                if processed % 1000 == 0 or processed == total_combos:
-                    print(f"Processed {processed}/{total_combos} combinations...")
+                chunk_list.append(len(chunk))  # Track chunk sizes for progress
+
+            # Use tqdm to show progress
+            with tqdm(total=total_combos, desc="Processing combinations") as pbar:
+                for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                    results = future.result()
+                    for metric, traj, combo, xt_bf, Pt_bf in results:
+                        if metric is not None and metric < best_metric:
+                            best_metric = metric
+                            best_trajectory = traj
+                            best_sensors = combo
+                            best_state = xt_bf
+                            best_cov = Pt_bf
+                    processed += chunk_list[i]
+                    pbar.update(chunk_list[i])
 
         print("Brute force search complete.")
         return {
-            'selected_sensors': best_sensors,
+            'selected_sensor_measurements': best_sensors,
             'final_state': best_state,
             'final_covariance': best_cov,
             'trajectory': best_trajectory,
@@ -1004,8 +1008,8 @@ class KF_SensorFusion:
 
     def plot_kf_states_2d(self, sf_KF_state, gps_alpha=0.1, kf_alpha=0.5, save_path='kf_plot.png'):
         """Plot the estimated states from the Kalman Filter against GPS data."""
-        X = [state[0] for state in sf_KF_state]
-        Y = [state[1] for state in sf_KF_state]
+        X = [state[1] for state in sf_KF_state]
+        Y = [state[2] for state in sf_KF_state]
         # Extracting Easting and Northing from GPS data
         eastings = [data['easting'] for data in self.utm_data]
         northings = [data['northing'] for data in self.utm_data]
@@ -1026,8 +1030,8 @@ class KF_SensorFusion:
 
     def animate_kf_states_2d(self, sf_KF_state, save_path='kf_animation.mp4', skip_rate=200):
         """Animate the estimated states from the Kalman Filter against GPS data."""
-        X = np.array([state[0] for state in sf_KF_state])
-        Y = np.array([state[1] for state in sf_KF_state])
+        X = np.array([state[1] for state in sf_KF_state])
+        Y = np.array([state[2] for state in sf_KF_state])
         
         eastings = np.array([data['easting'] for data in self.utm_data])
         northings = np.array([data['northing'] for data in self.utm_data])
@@ -1227,6 +1231,90 @@ class KF_SensorFusion:
         """Returns the UTM data."""
         return self.utm_data
 
+
+def plot_brute_force_vs_standard(utm_data, best_set, standard_kf_trajectory, start_idx, start_offset):
+    # Get the timestamps from indexed_sensor_data for the start and end indices
+    start_time = sensor_fusion.indexed_sensor_data[start_idx][2]
+    end_time = sensor_fusion.indexed_sensor_data[start_idx + start_offset][2]
+
+    # Find the closest GPS entries in UTM data for these times
+    gps_times = [entry['time'] for entry in utm_data]
+    def find_closest_gps_idx(target_time):
+        return min(range(len(gps_times)), key=lambda i: abs(gps_times[i] - target_time))
+    gps_idx_start = find_closest_gps_idx(start_time)
+    gps_idx_end = find_closest_gps_idx(end_time)
+    gps_start = utm_data[gps_idx_start]
+    gps_end = utm_data[gps_idx_end]
+    center_easting = (gps_start['easting'] + gps_end['easting']) / 2
+    center_northing = (gps_start['northing'] + gps_end['northing']) / 2
+
+    # Extract trajectories
+    bf_traj = best_set['trajectory']
+    std_traj = standard_kf_trajectory
+    bf_X = [state[1] for state in bf_traj]
+    bf_Y = [state[2] for state in bf_traj]
+    std_X = [state[1] for state in std_traj]
+    std_Y = [state[2] for state in std_traj]
+
+    # GPS for reference (using the range between the two GPS indices)
+    gps_X = [utm_data[i]['easting'] for i in range(min(gps_idx_start, gps_idx_end), max(gps_idx_start, gps_idx_end) + 1)]
+    gps_Y = [utm_data[i]['northing'] for i in range(min(gps_idx_start, gps_idx_end), max(gps_idx_start, gps_idx_end) + 1)]
+
+    plt.figure(figsize=(10, 8))
+    plt.scatter(gps_X, gps_Y, label='GPS Reference', c='black', s=10, alpha=0.5)
+    plt.plot(bf_X, bf_Y, label='Brute Force KF', color='blue', linewidth=2)
+    plt.plot(std_X, std_Y, label='Standard KF', color='orange', linewidth=2, linestyle='--')
+    plt.xlabel('Easting')
+    plt.ylabel('Northing')
+    plt.title('Brute Force vs Standard KF Trajectory')
+    plt.legend()
+    plt.grid(True)
+    # Center window around the midpoint of the GPS segment
+    window_size = 5  # meters, adjust as needed
+    plt.xlim(center_easting - window_size, center_easting + window_size)
+    plt.ylim(center_northing - window_size, center_northing + window_size)
+    plt.tight_layout()
+    plt.show()
+
+def plot_kf_centered_comparison(utm_data, best_set, standard_kf_trajectory):
+    # Extract standard KF trajectory and its center
+    std_traj = standard_kf_trajectory
+    std_X = [state[1] for state in std_traj]
+    std_Y = [state[2] for state in std_traj]
+    center_easting = (min(std_X) + max(std_X)) / 2
+    center_northing = (min(std_Y) + max(std_Y)) / 2
+
+    # Extract brute force KF trajectory
+    bf_traj = best_set['trajectory']
+    bf_X = [state[1] for state in bf_traj]
+    bf_Y = [state[2] for state in bf_traj]
+
+    # GPS for reference (using time range of the standard KF trajectory)
+    gps_times = [entry['time'] for entry in utm_data]
+    std_times = [state[0] for state in std_traj]
+    def find_closest_gps_idx(target_time):
+        return min(range(len(gps_times)), key=lambda i: abs(gps_times[i] - target_time))
+    gps_idx_start = find_closest_gps_idx(std_times[0])
+    gps_idx_end = find_closest_gps_idx(std_times[-1])
+    gps_X = [utm_data[i]['easting'] for i in range(min(gps_idx_start, gps_idx_end), max(gps_idx_start, gps_idx_end) + 1)]
+    gps_Y = [utm_data[i]['northing'] for i in range(min(gps_idx_start, gps_idx_end), max(gps_idx_start, gps_idx_end) + 1)]
+
+    plt.figure(figsize=(10, 8))
+    plt.scatter(gps_X, gps_Y, label='GPS Reference', c='black', s=10, alpha=0.5)
+    plt.plot(bf_X, bf_Y, label='Brute Force KF', color='blue', linewidth=2)
+    plt.plot(std_X, std_Y, label='Standard KF', color='orange', linewidth=2, linestyle='--')
+    plt.xlabel('Easting')
+    plt.ylabel('Northing')
+    plt.title('Brute Force vs Standard KF Trajectory')
+    plt.legend()
+    plt.grid(True)
+    # Center window around the midpoint of the standard KF segment
+    window_size = 500  # meters, adjust as needed
+    plt.xlim(center_easting - window_size, center_easting + window_size)
+    plt.ylim(center_northing - window_size, center_northing + window_size)
+    plt.tight_layout()
+    plt.show()
+
 # main code
 if __name__ == "__main__":
     # Define file paths for GPS and IMU data
@@ -1261,15 +1349,47 @@ if __name__ == "__main__":
 
 
     # Evaluate Kalman Filter performance with brute force search
+    # mi could be GPS measurement or IMU measurement # i is a index/number
 
-    start_idx = 54717
-    start_offset = 50  # Set to None to process all data
+    # [m1,m2,m3, ... m100000] # orignal measurements for trajectory
+
+    # [m54717, ..., 54767] # selected portion of trajectory
+
+    # # Ex. Subsets of measurments sampled and to be evaluated
+    # 4/50 seconds
+    # [[mm54717_GPS, m54718_IMU, m54719_IMU], [m54720_IMU, m54721_IMU], [m54722_IMU, m54723_IMU], [m54724_GPS, m54725_IMU, m54726_IMU]]
+    
+
+
+    # [mm54717_GPS, m54720_IMU, m54722_IMU, m54724_GPS] --> calculate accuracy metric --> update best if better
+    # [mm54717_GPS, m54720_IMU, m54722_IMU, m54725_IMU] --> calculate accuracy metric --> update best if better
+    # [mm54717_GPS, m54720_IMU, m54722_IMU, m54726_IMU] --> calculate accuracy metric --> update best if better
+
+    # [mm54717_GPS, m54720_IMU, m54723_IMU, m54724_GPS] --> calculate accuracy metric --> update best if better
+    # [mm54717_GPS, m54720_IMU, m54723_IMU, m54725_IMU] --> calculate accuracy metric --> update best if better
+    # [mm54717_GPS, m54720_IMU, m54723_IMU, m54726_IMU] --> calculate accuracy metric --> update best if better
+    # # subset size is 2 or 3
+
+    # start_offset * 1/sampling_frq = seconds of trajectory being processed/evaluated
+
+    start_idx = 60000
+    start_offset = 20  # Set to None to process all data
     sampling_frq = 50
+
+    # 1/50 seconds
+    # 1/50 seconds
+    # 1/50 seconds
+    # 1/50 seconds 
 
     best_set = sensor_fusion.run_brute_force_kalman_filter(start_idx, start_idx + start_offset, sampling_frq)
     print("Accuracy Metric (Total Position RMSE):", best_set['accuracy_metric']) # Accuracy Metric (Total Position RMSE): 1.2345
-
+    
+    output = sensor_fusion.run_kalman_filter(start_idx, start_idx + start_offset)
+    print("Accuracy Metric (Total Position RMSE):", sensor_fusion.calculate_accuracy_metrics(output)) # Accuracy
+                # sf_KF_state.append((time, xt[0], xt[1], xt[2], xt[3], xt[4], xt[5]))  # Append initial state
 
     sensor_fusion.set_processing_frequency(sampling_frq) # Set to 50 Hz for comparison
     standard_kf_trajectory = sensor_fusion.run_kalman_filter_scheduled(start_idx, start_idx + start_offset)
     print("Accuracy Metric (Total Position RMSE):", sensor_fusion.calculate_accuracy_metrics(standard_kf_trajectory)) # Accuracy
+
+    # plot_kf_centered_comparison(sensor_fusion.get_utm_data(), output, standard_kf_trajectory)
