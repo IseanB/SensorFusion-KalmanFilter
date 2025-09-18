@@ -671,108 +671,122 @@ class KF_SensorFusion:
 
     def run_kalman_filter_scheduled(self, start_idx, end_idx):
         """Run the Kalman Filter to fuse IMU and GPS data for pose estimation."""
-        # Initial state [x, y, z, roll, pitch, yaw, v_x, v_y, v_z, angular_x, angular_y, angular_z, a_x, a_y, a_z]
-        xt = np.array([0, 0, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0,    0, 0, 0])
-
-        # Initial covariance matrix
+        # Initialize state and covariance
+        xt = np.zeros(15)
         Pt = np.array([
-                        [1000, 0, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],       # x
-                        [0, 1000, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],       # y
-                        [0, 0, 1000,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],       # z
-                        [0, 0, 0,        100, 0, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],       # roll
-                        [0, 0, 0,        0, 100, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],       # pitch
-                        [0, 0, 0,        0, 0, 100,     0, 0, 0,    0, 0, 0,    0, 0, 0],       # yaw
-                        [0, 0, 0,        0, 0, 0,     100, 0, 0,    0, 0, 0,    0, 0, 0],       # v_x
-                        [0, 0, 0,        0, 0, 0,     0, 100, 0,    0, 0, 0,    0, 0, 0],       # v_y
-                        [0, 0, 0,        0, 0, 0,     0, 0, 100,    0, 0, 0,    0, 0, 0],       # v_z
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    100, 0, 0,    0, 0, 0],       # angular_x
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 100, 0,    0, 0, 0],       # angular_y
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 100,    0, 0, 0],       # angular_z
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      1000, 0, 0],    # a_x
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 1000, 0],    # a_y
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 0, 1000],    # a_z
+                        [1000, 0, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
+                        [0, 1000, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
+                        [0, 0, 1000,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
+                        [0, 0, 0,        100, 0, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],
+                        [0, 0, 0,        0, 100, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],
+                        [0, 0, 0,        0, 0, 100,     0, 0, 0,    0, 0, 0,    0, 0, 0],
+                        [0, 0, 0,        0, 0, 0,     100, 0, 0,    0, 0, 0,    0, 0, 0],
+                        [0, 0, 0,        0, 0, 0,     0, 100, 0,    0, 0, 0,    0, 0, 0],
+                        [0, 0, 0,        0, 0, 0,     0, 0, 100,    0, 0, 0,    0, 0, 0],
+                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    100, 0, 0,    0, 0, 0],
+                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 100, 0,    0, 0, 0],
+                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 100,    0, 0, 0],
+                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      1000, 0, 0],
+                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 1000, 0],
+                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 0, 1000],
                     ])
         I = np.eye(15)
 
-        # Create a list to store the state (X, Y, Z, roll, pitch, yaw)
-        sf_KF_state = [(xt[0], xt[1], xt[2], xt[3], xt[4], xt[5])]  # Storing initial state
-        gps_started = False  
+        # Find the initial GPS measurement in the subset to initialize xt and previous_time.
+        gps_started = False
+        previous_time = None
+        for (index, sensor_type, time, sensor_data) in self.indexed_sensor_data[start_idx:end_idx]:
+            if sensor_type == 'GPS':
+                xt[0] = sensor_data['easting']
+                xt[1] = sensor_data['northing']
+                xt[2] = sensor_data['altitude']
+                previous_time = time
+                gps_started = True
+                break
+        if not gps_started:
+            print("WARN: No GPS measurement found in the sensor subset.")
+            return None
+
+        # Store initial state (using the GPS time)
+        sf_KF_state = [(previous_time, xt[0], xt[1], xt[2], xt[3], xt[4], xt[5])]
+        
         sensor_data_queue = []
         for i, (index, sensor_type, time, sensor_data) in tqdm(enumerate(self.indexed_sensor_data[start_idx:end_idx])):
-            # Intial processing condition: first GPS data is encountered
-            if not gps_started and sensor_type == 'GPS' and not gps_started:
-                gps_started = True
-                previous_time = time  # Initialize previous_time with the first GPS time
-            if not gps_started:
-                continue  # Skip until first GPS data is encountered
+            # Only process measurements occurring after initialization.
+            if time < previous_time:
+                continue
 
-            # Collect sensor data during sampling_period 
+            # Collect sensor data over the sampling period.
             if time - previous_time < 1/self.processing_frequency:
                 sensor_data_queue.append((index, sensor_type, time, sensor_data))
                 continue
-            
-            if(len(sensor_data_queue) == 0): # Add more measurements until able to select
+
+            # Ensure there is at least one measurement for update.
+            if len(sensor_data_queue) == 0:
                 sensor_data_queue.append((index, sensor_type, time, sensor_data))
             
-            selected_measurement_index = self.scheduler.greedy_schedule(sensor_data_queue, 
-                                                                        S_sigma=Pt, 
-                                                                        measurement_cov = {"IMU": self.get_imu_measurement_noise_covariance_matrix(), "GPS": self.get_gps_measurement_noise_covariance_matrix()}, 
-                                                                        observation_cov = {"IMU": self.get_imu_observation_matrix(), "GPS": self.get_gps_observation_matrix()}, 
-                                                                        device='cpu')
-            # print("Selected measurement index: ", selected_measurement_index)
-            selected_measurement = sensor_data_queue[selected_measurement_index]
+            # Choose the best measurement using the scheduler.
+            selected_measurement_index = self.scheduler.greedy_schedule(
+                sensor_data_queue,
+                S_sigma=Pt,
+                measurement_cov={
+                    "IMU": self.get_imu_measurement_noise_covariance_matrix(),
+                    "GPS": self.get_gps_measurement_noise_covariance_matrix()
+                },
+                observation_cov={
+                    "IMU": self.get_imu_observation_matrix(),
+                    "GPS": self.get_gps_observation_matrix()
+                },
+                device='cpu'
+            )
             sensor_data_queue = []
-            (index, sensor_type, time, sensor_data) = selected_measurement
+            (index, sensor_type, time, sensor_data) = self.indexed_sensor_data[selected_measurement_index]
             
             # Calculate dt
             dt = time - previous_time if previous_time is not None else 0
 
-            # Prediction step for both GPS and IMU
+            # Prediction step for both GPS and IMU.
             F = self.get_state_transition_matrix(dt)
             Qt = self.get_process_noise_covariance_matrix(dt)
-            xt = np.dot(F, xt)   # State prediction
-            Pt = self.predict_covariance(Pt, F, Qt)  # Covariance prediction
+            xt = np.dot(F, xt)
+            Pt = self.predict_covariance(Pt, F, Qt)
 
-            # Update step based on sensor type
+            # Update step based on sensor type.
             if sensor_type == 'GPS':
                 H_GPS = self.get_gps_observation_matrix()
                 R_GPS = self.get_gps_measurement_noise_covariance_matrix()
-                Zt_GPS = [sensor_data['easting'], sensor_data['northing'], sensor_data['altitude']]  # Extracting GPS measurements
+                Zt_GPS = [sensor_data['easting'], sensor_data['northing'], sensor_data['altitude']]
                 Kt = self.calculate_kalman_gain(Pt, H_GPS, R_GPS)
                 y = Zt_GPS - np.dot(H_GPS, xt)
-                # State update
-                xt = xt + np.dot(Kt,y)
-                # Covariance update
+                xt = xt + np.dot(Kt, y)
                 Pt = np.dot(I - np.dot(Kt, H_GPS), Pt)
-                
             elif sensor_type == 'IMU':
-                # Dead reckoning for IMU data (integration of velocity and position)
                 ax = sensor_data[7]
                 ay = sensor_data[8]
                 az = sensor_data[9]
-                Vx = xt[6] + ax * dt  # Vx = Vx + ax*dt
-                Vy = xt[7] + ay * dt  # Vy = Vy + ay*dt
-                Vz = xt[8] + az * dt  # Vz = Vz + az*dt
-                X = xt[0] + Vx * dt  # X = X + Vx*dt
-                Y = xt[1] + Vy * dt  # Y = Y + Vy*dt
-                Z = xt[2] + Vz * dt  # Y = Y + Vy*dt
+                Vx = xt[6] + ax * dt
+                Vy = xt[7] + ay * dt
+                Vz = xt[8] + az * dt
+                X = xt[0] + Vx * dt
+                Y = xt[1] + Vy * dt
+                Z = xt[2] + Vz * dt
                 roll = sensor_data[1]
                 pitch = sensor_data[2]
                 yaw = sensor_data[3]
                 ang_x = sensor_data[4]
                 ang_y = sensor_data[5]
                 ang_z = sensor_data[6]
-
-                Zt_IMU = [X, Y, Z, roll, pitch, yaw, Vx, Vy, Vz, ang_x, ang_y, ang_z, ax, ay, az]  # IMU measurements
+                Zt_IMU = [X, Y, Z, roll, pitch, yaw, Vx, Vy, Vz, ang_x, ang_y, ang_z, ax, ay, az]
                 H_IMU = self.get_imu_observation_matrix()
                 R_IMU = self.get_imu_measurement_noise_covariance_matrix()
                 Kt = self.calculate_kalman_gain(Pt, H_IMU, R_IMU)
                 y = np.array(Zt_IMU) - np.dot(H_IMU, xt)
                 xt = xt + np.dot(Kt, y)
                 Pt = np.dot(I - np.dot(Kt, H_IMU), Pt)
+            
+            sf_KF_state.append((time, xt[0], xt[1], xt[2], xt[3], xt[4], xt[5]))
+            previous_time = time
 
-            sf_KF_state.append((time, xt[0], xt[1], xt[2], xt[3], xt[4], xt[5]))  # Append updated state (X, Y, Z, Roll, Pitch, Yaw)
-            previous_time = time  # Update previous time
         return sf_KF_state
 
     def calculate_accuracy_metrics(self, sf_KF_state_with_time):
@@ -813,7 +827,7 @@ class KF_SensorFusion:
         #     }
         return total_position_rmse
 
-    def run_brute_force_kalman_filter(self, start_idx=0, end_idx=None, overwrite_sampling_freq=None, max_combos_in_memory=1000):
+    def run_sampled_brute_force_kalman_filter(self, start_idx=0, end_idx=None, overwrite_sampling_freq=None, max_combos_in_memory=1000):
         from itertools import product, islice
         class_args = {
             'get_state_transition_matrix': self.get_state_transition_matrix,
@@ -842,9 +856,13 @@ class KF_SensorFusion:
         sensor_data_queue = []
         for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data[start_idx:end_idx]):
             if not gps_started and sensor_type == 'GPS':
+                xt[0] = sensor_data['easting']
+                xt[1] = sensor_data['northing']
+                xt[2] = sensor_data['altitude']
                 gps_started = True
                 previous_time = time
             if not gps_started:
+                print("WARN: No GPS measurement found in the sensor subset.")
                 continue
 
             if (overwrite_sampling_freq is not None):
@@ -898,7 +916,9 @@ class KF_SensorFusion:
         print(f"Total combinations to process: {total_combos}")
 
         # Use all available CPU cores
-        num_workers = multiprocessing.cpu_count()
+        # num_workers = multiprocessing.cpu_count()
+        print("Total number of cpu cores available: ", multiprocessing.cpu_count())
+        num_workers = 50
         with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
             futures = []
             chunk_list = []
@@ -961,47 +981,8 @@ class KF_SensorFusion:
         deadreckoned_IMU_estimates = []
 # unbias_entry = entry[:1] + [roll, pitch, yaw] + unbias_angular_velocity.tolist() + unbias_linear_acceleration.tolist() + entry[11:]             
         previous_time = None
-        for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data):
-            if sensor_type != 'IMU':
-                continue  # Process only IMU data
-
-            # Calculate dt
-            dt = time - previous_time if previous_time is not None else 0
-
-            # Prediction step for IMU
-            F = self.get_state_transition_matrix(dt)
-            Qt = self.get_process_noise_covariance_matrix(dt)
-            xt = np.dot(F, xt)   # State prediction
-            Pt = self.predict_covariance(Pt, F, Qt)  # Covariance prediction
-
-            # Dead reckoning for IMU data
-            ax = sensor_data[7]
-            ay = sensor_data[8]
-            az = sensor_data[9]
-            Vx = xt[6] + ax * dt  # Vx = Vx + ax*dt
-            Vy = xt[7] + ay * dt  # Vy = Vy + ay*dt
-            Vz = xt[8] + az * dt  # Vz = Vz + az*dt
-            X = xt[0] + Vx * dt  # X = X + Vx*dt
-            Y = xt[1] + Vy * dt  # Y = Y + Vy*dt
-            Z = xt[2] + Vz * dt  # Y = Y + Vy*dt
-            roll = sensor_data[1]
-            pitch = sensor_data[2]
-            yaw = sensor_data[3]
-            ang_x = sensor_data[4]
-            ang_y = sensor_data[5]
-            ang_z = sensor_data[6]
-            Zt_IMU = [X, Y, Z, roll, pitch, yaw, Vx, Vy, Vz, ang_x, ang_y, ang_z, ax, ay, az]  # IMU measurements
-
-            H_IMU = self.get_imu_observation_matrix()
-            R_IMU = self.get_imu_measurement_noise_covariance_matrix()
-            Kt = self.calculate_kalman_gain(Pt, H_IMU, R_IMU)
-            y = np.array(Zt_IMU) - np.dot(H_IMU, xt)
-            xt = xt + np.dot(Kt, y)
-            Pt = np.dot(I - np.dot(Kt, H_IMU), Pt)
-
-            deadreckoned_IMU_estimates.append((xt[0], xt[1], xt[2], xt[3], xt[4], xt[5]))  # Append updated state (X, Y, Theta)
-            previous_time = time  # Update previous time
-
+        # for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data):
+            
         return deadreckoned_IMU_estimates
 
     #### Visualization functions ####
@@ -1372,24 +1353,31 @@ if __name__ == "__main__":
 
     # start_offset * 1/sampling_frq = seconds of trajectory being processed/evaluated
 
-    start_idx = 60000
-    start_offset = 20  # Set to None to process all data
+    start_idx = 54717  # i1_t=0 i2_t=0.0001 g1_t=0.0006 i3 i4 ... i100 g40
+    start_offset = 100
     sampling_frq = 50
 
-    # 1/50 seconds
-    # 1/50 seconds
-    # 1/50 seconds
-    # 1/50 seconds 
+    # UIOP
+    # I = GPS
+    # U = IMU
+    # P = Radar
+    # O = Images
 
-    best_set = sensor_fusion.run_brute_force_kalman_filter(start_idx, start_idx + start_offset, sampling_frq)
-    print("Accuracy Metric (Total Position RMSE):", best_set['accuracy_metric']) # Accuracy Metric (Total Position RMSE): 1.2345
+    # TIME                  # SENSOR MEASSURMENT SUBSET
+    # 0 - 1/50 (0 - 0.02) seconds      # U U I (0.019) I (0.0001)
+    # 1/50 - 2/50 seconds   # U U U P O O
+    # 2/50 - 3/50 seconds   # U P O I
+    # 3/50 - 4/50 seconds   # U U I P
+
+    # best_set = sensor_fusion.run_sampled_brute_force_kalman_filter(start_idx, start_idx + start_offset, sampling_frq)
+    # print("Brute Force - Accuracy Metric (Total Position RMSE):", best_set['accuracy_metric']) # Accuracy Metric (Total Position RMSE): 1.2345
     
-    output = sensor_fusion.run_kalman_filter(start_idx, start_idx + start_offset)
-    print("Accuracy Metric (Total Position RMSE):", sensor_fusion.calculate_accuracy_metrics(output)) # Accuracy
+    output = sensor_fusion.run_kalman_filter(start_idx, start_idx + start_offset) # ONLY USE IMU, BROKEN
+    print("Regular KF - Accuracy Metric (Total Position RMSE):", sensor_fusion.calculate_accuracy_metrics(output)) # Accuracy
                 # sf_KF_state.append((time, xt[0], xt[1], xt[2], xt[3], xt[4], xt[5]))  # Append initial state
 
     sensor_fusion.set_processing_frequency(sampling_frq) # Set to 50 Hz for comparison
     standard_kf_trajectory = sensor_fusion.run_kalman_filter_scheduled(start_idx, start_idx + start_offset)
+    
     print("Accuracy Metric (Total Position RMSE):", sensor_fusion.calculate_accuracy_metrics(standard_kf_trajectory)) # Accuracy
-
-    # plot_kf_centered_comparison(sensor_fusion.get_utm_data(), output, standard_kf_trajectory)
+    # plot_kf_centered_comparison(sensor_fusion.get_utm_data(), best_set, standard_kf_trajectory)
