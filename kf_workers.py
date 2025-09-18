@@ -3,6 +3,7 @@ import csv
 import numpy as np
 import utm
 import matplotlib.pyplot as plt
+import signal
 # from mpl_toolkits.mplot3d import Axes3D
 # from matplotlib.animation import FuncAnimation, PillowWriter
 import matplotlib.pyplot as plt
@@ -10,52 +11,81 @@ import matplotlib.animation as animation
 from tqdm import tqdm
 import operator
 import concurrent.futures
-import multiprocessing
+from multiprocessing import Pool
+import multiprocessing as mp
 import sys
 from scipy.interpolate import interp1d
 import math
 import decimal
-# from kf_workers import evaluate_combo_chunk_worker
 
 
 def evaluate_combo_chunk_worker(chunk, xt, Pt, class_args):
+    """Worker function with better error handling and memory management."""
     results = []
-    for combo in chunk:
-        xt_bf = xt.copy()
-        Pt_bf = Pt.copy()
-        traj = []
-        prev_time = None
-        for (idx, stype, t, sdata) in combo:
-            dt = t - prev_time if prev_time is not None else 0
-            F = class_args['get_state_transition_matrix'](dt)
-            Qt = class_args['get_process_noise_covariance_matrix'](dt)
-            xt_bf = np.dot(F, xt_bf)
-            Pt_bf = class_args['predict_covariance'](Pt_bf, F, Qt)
-            if stype == 'GPS':
-                H = class_args['get_gps_observation_matrix']()
-                R = class_args['get_gps_measurement_noise_covariance_matrix']()
-                Z = [sdata['easting'], sdata['northing'], sdata['altitude']]
-            else:
-                ax, ay, az = sdata[7], sdata[8], sdata[9]
-                Vx = xt_bf[6] + ax * dt
-                Vy = xt_bf[7] + ay * dt
-                Vz = xt_bf[8] + az * dt
-                X = xt_bf[0] + Vx * dt
-                Y = xt_bf[1] + Vy * dt
-                Z = xt_bf[2] + Vz * dt
-                roll, pitch, yaw = sdata[1], sdata[2], sdata[3]
-                ang_x, ang_y, ang_z = sdata[4], sdata[5], sdata[6]
-                Z = [X, Y, Z, roll, pitch, yaw, Vx, Vy, Vz, ang_x, ang_y, ang_z, ax, ay, az]
-                H = class_args['get_imu_observation_matrix']()
-                R = class_args['get_imu_measurement_noise_covariance_matrix']()
-            K = class_args['calculate_kalman_gain'](Pt_bf, H, R)
-            y = np.array(Z) - np.dot(H, xt_bf)
-            xt_bf = xt_bf + np.dot(K, y)
-            Pt_bf = np.dot(np.eye(15) - np.dot(K, H), Pt_bf)
-            traj.append((t, *xt_bf[:6]))
-            prev_time = t
-        metric = class_args['calculate_accuracy_metrics'](traj)
-        results.append((metric, traj, combo, xt_bf, Pt_bf))
+    
+    try:
+        for combo in chunk:
+            try:
+                xt_bf = xt.copy()
+                Pt_bf = Pt.copy()
+                traj = []
+                prev_time = None
+                
+                for (idx, stype, t, sdata) in combo:
+                    dt = t - prev_time if prev_time is not None else 0
+                    F = class_args['get_state_transition_matrix'](dt)
+                    Qt = class_args['get_process_noise_covariance_matrix'](dt)
+                    xt_bf = np.dot(F, xt_bf)
+                    Pt_bf = class_args['predict_covariance'](Pt_bf, F, Qt)
+                    
+                    if stype == 'GPS':
+                        H = class_args['get_gps_observation_matrix']()
+                        R = class_args['get_gps_measurement_noise_covariance_matrix']()
+                        Z = [sdata['easting'], sdata['northing'], sdata['altitude']]
+                    else:
+                        ax, ay, az = sdata[7], sdata[8], sdata[9]
+                        Vx = xt_bf[6] + ax * dt
+                        Vy = xt_bf[7] + ay * dt
+                        Vz = xt_bf[8] + az * dt
+                        X = xt_bf[0] + Vx * dt
+                        Y = xt_bf[1] + Vy * dt
+                        Z = xt_bf[2] + Vz * dt
+                        roll, pitch, yaw = sdata[1], sdata[2], sdata[3]
+                        ang_x, ang_y, ang_z = sdata[4], sdata[5], sdata[6]
+                        Z = [X, Y, Z, roll, pitch, yaw, Vx, Vy, Vz, ang_x, ang_y, ang_z, ax, ay, az]
+                        H = class_args['get_imu_observation_matrix']()
+                        R = class_args['get_imu_measurement_noise_covariance_matrix']()
+                    
+                    K = class_args['calculate_kalman_gain'](Pt_bf, H, R)
+                    y = np.array(Z) - np.dot(H, xt_bf)
+                    xt_bf = xt_bf + np.dot(K, y)
+                    Pt_bf = np.dot(np.eye(15) - np.dot(K, H), Pt_bf)
+                    traj.append((t, *xt_bf[:6]))
+                    prev_time = t
+                
+                # Calculate metric for this combination
+                try:
+                    metric_result = class_args['calculate_accuracy_metrics'](traj)
+                    if metric_result and 'total_position_rmse' in metric_result:
+                        metric = metric_result['total_position_rmse']
+                    else:
+                        metric = float('inf')  # Invalid result
+                except Exception as metric_error:
+                    print(f"Error calculating metrics: {metric_error}")
+                    metric = float('inf')
+                
+                # Only keep essential data to reduce memory usage
+                results.append((metric, traj, combo, xt_bf.copy(), None))  # Don't return covariance to save memory
+                
+            except Exception as combo_error:
+                print(f"Error processing combination: {combo_error}")
+                # Continue with next combination instead of failing entire chunk
+                continue
+                
+    except Exception as chunk_error:
+        print(f"Error processing chunk: {chunk_error}")
+        return []  # Return empty results for this chunk
+    
     return results
 
 class Scheduler:
@@ -330,9 +360,9 @@ class KF_SensorFusion:
             unbias_entry = entry[:1] + [roll, pitch, yaw] + unbias_angular_velocity.tolist() + unbias_linear_acceleration.tolist() + entry[11:]
             unbias_imu_data.append(unbias_entry)
         # Print the first two entries to check if the data is stored well
-        print("First two entries in unbias_imu_data:")
-        for i in range(2):
-            print(unbias_imu_data[i])
+        # print("First two entries in unbias_imu_data:")
+        # for i in range(2):
+        #     print(unbias_imu_data[i])
         self.unbias_imu_data = unbias_imu_data
 
     def combine_sensor_data(self):
@@ -347,16 +377,16 @@ class KF_SensorFusion:
         combined_data.sort(key=lambda x: x[1])
         self.indexed_sensor_data = [(i, *data) for i, data in enumerate(combined_data)]
         # Print the first GPS and IMU entry
-        gps_printed = imu_printed = False
-        for entry in self.indexed_sensor_data:
-            if entry[1] == 'GPS' and not gps_printed:
-                print("First GPS Entry:", entry)
-                gps_printed = True
-            elif entry[1] == 'IMU' and not imu_printed:
-                print("First IMU Entry:", entry)
-                imu_printed = True
-            if gps_printed and imu_printed:
-                break
+        # gps_printed = imu_printed = False
+        # for entry in self.indexed_sensor_data:
+        #     if entry[1] == 'GPS' and not gps_printed:
+        #         print("First GPS Entry:", entry)
+        #         gps_printed = True
+        #     elif entry[1] == 'IMU' and not imu_printed:
+        #         print("First IMU Entry:", entry)
+        #         imu_printed = True
+        #     if gps_printed and imu_printed:
+        #         break
             
     #take this function from internet as its standard function
     def quaternion_to_euler(self, x, y, z, w):
@@ -582,6 +612,101 @@ class KF_SensorFusion:
         # Calculating the Kalman Gain
         K_next = np.dot(np.dot(P_next, H.T), np.linalg.inv(intermediate_matrix))
         return K_next
+    
+    def run_kalman_filter_full(self):
+        """
+        Run the Kalman Filter over all available sensor data and store the resulting state
+        trajectory, covariance matrices, and log determinant of covariance as ground truth.
+        This version is refactored for robustness to prevent list length mismatches.
+        """
+        if not hasattr(self, 'indexed_sensor_data') or not self.indexed_sensor_data:
+            print("Sensor data has not been combined or is empty.")
+            return [], [], []
+
+        # --- Initialization Step ---
+        xt = np.zeros(15)
+        Pt = np.diag([10000]*3 + [1000]*3 + [1000]*3 + [1000]*3 + [10000]*3)
+        I = np.eye(15)
+
+        # Find the first GPS measurement to initialize the state robustly
+        first_gps_idx = -1
+        initial_time = None
+        for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data):
+            if sensor_type == 'GPS':
+                xt[0] = sensor_data['easting']
+                xt[1] = sensor_data['northing']
+                xt[2] = sensor_data['altitude']
+                initial_time = time
+                first_gps_idx = i
+                break
+        
+        if first_gps_idx == -1:
+            print("No GPS data found to initialize the filter.")
+            return [], [], []
+
+        # Initialize all lists with the state *at* the first GPS point
+        sf_KF_state = [(initial_time, *xt[:6])]
+        sf_KF_covariance = [Pt.copy()]
+        sign, log_det = np.linalg.slogdet(Pt)
+        sf_KF_log_det = [log_det]
+        
+        previous_time = initial_time
+
+        # --- Main Loop Step ---
+        # Loop through all data points *after* the initializing GPS point
+        for (index, sensor_type, time, sensor_data) in tqdm(self.indexed_sensor_data[first_gps_idx + 1:], desc="Calculating Ground Truth"):
+            dt = time - previous_time
+            if dt < 0: # Sanity check for out-of-order data
+                previous_time = time
+                continue
+
+            # Prediction Step
+            F = self.get_state_transition_matrix(dt)
+            Qt = self.get_process_noise_covariance_matrix(dt)
+            xt = np.dot(F, xt)
+            Pt = self.predict_covariance(Pt, F, Qt)
+
+            # Update Step
+            if sensor_type == 'GPS':
+                H = self.get_gps_observation_matrix()
+                R = self.get_gps_measurement_noise_covariance_matrix()
+                Z = [sensor_data['easting'], sensor_data['northing'], sensor_data['altitude']]
+            else: # IMU
+                ax, ay, az = sensor_data[7], sensor_data[8], sensor_data[9]
+                Vx, Vy, Vz = xt[6] + ax * dt, xt[7] + ay * dt, xt[8] + az * dt
+                X, Y, Z_pos = xt[0] + Vx * dt, xt[1] + Vy * dt, xt[2] + Vz * dt
+                roll, pitch, yaw = sensor_data[1], sensor_data[2], sensor_data[3]
+                ang_x, ang_y, ang_z = sensor_data[4], sensor_data[5], sensor_data[6]
+                Z = [X, Y, Z_pos, roll, pitch, yaw, Vx, Vy, Vz, ang_x, ang_y, ang_z, ax, ay, az]
+                H = self.get_imu_observation_matrix()
+                R = self.get_imu_measurement_noise_covariance_matrix()
+            
+            K = self.calculate_kalman_gain(Pt, H, R)
+            y = np.array(Z) - np.dot(H, xt)
+            xt = xt + np.dot(K, y)
+            Pt = np.dot(I - np.dot(K, H), Pt)
+
+            # Append results for this time step to all three lists
+            sf_KF_state.append((time, *xt[:6]))
+            sf_KF_covariance.append(Pt.copy())
+            sign, log_det = np.linalg.slogdet(Pt)
+            sf_KF_log_det.append(log_det)
+            
+            previous_time = time
+
+        self._ground_truth = sf_KF_state
+        self._ground_truth_cov = sf_KF_covariance
+        print("Ground truth Kalman Filter trajectory stored.")
+        
+        return sf_KF_state, sf_KF_covariance, sf_KF_log_det
+
+    def get_GT(self):
+        """Return the ground truth trajectory computed by the Kalman Filter."""
+        if hasattr(self, '_ground_truth'):
+            return self._ground_truth
+        else:
+            print("Ground truth not computed yet. Please run run_kalman_filter_full() first.")
+            return None
 
     def run_kalman_filter(self, start_idx, end_idx):
         """Run the Kalman Filter to fuse IMU and GPS data for pose estimation."""
@@ -590,26 +715,27 @@ class KF_SensorFusion:
 
         # Initial covariance matrix
         Pt = np.array([
-                        [1000, 0, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],       # x
-                        [0, 1000, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],       # y
-                        [0, 0, 1000,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],       # z
-                        [0, 0, 0,        100, 0, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],       # roll
-                        [0, 0, 0,        0, 100, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],       # pitch
-                        [0, 0, 0,        0, 0, 100,     0, 0, 0,    0, 0, 0,    0, 0, 0],       # yaw
-                        [0, 0, 0,        0, 0, 0,     100, 0, 0,    0, 0, 0,    0, 0, 0],       # v_x
-                        [0, 0, 0,        0, 0, 0,     0, 100, 0,    0, 0, 0,    0, 0, 0],       # v_y
-                        [0, 0, 0,        0, 0, 0,     0, 0, 100,    0, 0, 0,    0, 0, 0],       # v_z
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    100, 0, 0,    0, 0, 0],       # angular_x
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 100, 0,    0, 0, 0],       # angular_y
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 100,    0, 0, 0],       # angular_z
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      1000, 0, 0],    # a_x
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 1000, 0],    # a_y
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 0, 1000],    # a_z
-                    ])
+            [10000, 0, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 10000, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 10000,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        1000, 0, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 1000, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 1000,     0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     1000, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 1000, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 1000,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    1000, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 1000, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 1000,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      10000, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 10000, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 0, 10000],
+        ])
         I = np.eye(15)
 
         # Create a list to store the state (X, Y, Z, roll, pitch, yaw)
         sf_KF_state = [(0, xt[0], xt[1], xt[2], xt[3], xt[4], xt[5])]  # Storing initial state
+        sf_KF_covariance = [Pt.copy()]
         gps_started = False  
         for i, (index, sensor_type, time, sensor_data) in tqdm(enumerate(self.indexed_sensor_data[start_idx:end_idx])):
             # # Start processing only when the first GPS data is encountered
@@ -666,30 +792,31 @@ class KF_SensorFusion:
                 Pt = np.dot(I - np.dot(Kt, H_IMU), Pt)
 
             sf_KF_state.append((time, xt[0], xt[1], xt[2], xt[3], xt[4], xt[5]))  # Append updated state (X, Y, Z, Roll, Pitch, Yaw)
+            sf_KF_covariance.append(Pt.copy())
             previous_time = time  # Update previous time
-        return sf_KF_state
+        return sf_KF_state, sf_KF_covariance
 
     def run_kalman_filter_scheduled(self, start_idx, end_idx):
         """Run the Kalman Filter to fuse IMU and GPS data for pose estimation."""
         # Initialize state and covariance
         xt = np.zeros(15)
         Pt = np.array([
-                        [1000, 0, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
-                        [0, 1000, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
-                        [0, 0, 1000,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
-                        [0, 0, 0,        100, 0, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],
-                        [0, 0, 0,        0, 100, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],
-                        [0, 0, 0,        0, 0, 100,     0, 0, 0,    0, 0, 0,    0, 0, 0],
-                        [0, 0, 0,        0, 0, 0,     100, 0, 0,    0, 0, 0,    0, 0, 0],
-                        [0, 0, 0,        0, 0, 0,     0, 100, 0,    0, 0, 0,    0, 0, 0],
-                        [0, 0, 0,        0, 0, 0,     0, 0, 100,    0, 0, 0,    0, 0, 0],
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    100, 0, 0,    0, 0, 0],
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 100, 0,    0, 0, 0],
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 100,    0, 0, 0],
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      1000, 0, 0],
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 1000, 0],
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 0, 1000],
-                    ])
+            [10000, 0, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 10000, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 10000,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        1000, 0, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 1000, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 1000,     0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     1000, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 1000, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 1000,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    1000, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 1000, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 1000,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      10000, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 10000, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 0, 10000],
+        ])
         I = np.eye(15)
 
         # Find the initial GPS measurement in the subset to initialize xt and previous_time.
@@ -789,46 +916,87 @@ class KF_SensorFusion:
 
         return sf_KF_state
 
-    def calculate_accuracy_metrics(self, sf_KF_state_with_time):
-        utm_data = self.get_utm_data()
-        if not sf_KF_state_with_time or not utm_data:
-            print("State list or UTM data is empty. Cannot calculate accuracy.")
+    def calculate_accuracy_metrics(self, candidate_trajectory, window_size=5):
+        """
+        Compare a candidate trajectory against the ground truth trajectory stored in self._ground_truth.
+        Instead of simply using the first and last state's timestamps, this version uses all measurements 
+        in the first and last 'window_size' of the candidate trajectory to determine a robust time window.
+        
+        Parameters:
+            candidate_trajectory (list of tuples): Each tuple contains (time, x, y, z, roll, pitch, yaw)
+            window_size (int): Number of measurements from the start and end used to define the time window.
+        
+        Returns:
+            dict: Dictionary containing overall RMSE, per-point errors, and other details.
+        """
+        if not candidate_trajectory:
+            print("Candidate trajectory is empty. Cannot calculate accuracy.")
             return None
 
-        gps_times = np.array([entry['time'] for entry in utm_data])
-        gps_positions = np.array([[entry['easting'], entry['northing'], entry['altitude']] for entry in utm_data])
+        if not (hasattr(self, "_ground_truth") and self._ground_truth):
+            print("Ground truth trajectory is not available. Run run_kalman_filter_full() first.")
+            return None
 
-        kf_times = np.array([state[0] for state in sf_KF_state_with_time])
-        kf_positions = np.array([state[1:4] for state in sf_KF_state_with_time])
+        # Determine robust time window from candidate trajectory
+        if len(candidate_trajectory) < window_size:
+            candidate_start = candidate_trajectory[0][0]
+            candidate_end = candidate_trajectory[-1][0]
+        else:
+            candidate_start = min(state[0] for state in candidate_trajectory[:window_size])
+            candidate_end = max(state[0] for state in candidate_trajectory[-window_size:])
 
-        # Interpolate GPS positions to KF times
-        interp_east = interp1d(gps_times, gps_positions[:, 0], kind='linear', fill_value="extrapolate")
-        interp_north = interp1d(gps_times, gps_positions[:, 1], kind='linear', fill_value="extrapolate")
-        interp_alt = interp1d(gps_times, gps_positions[:, 2], kind='linear', fill_value="extrapolate")
-        gps_interp_positions = np.stack([interp_east(kf_times), interp_north(kf_times), interp_alt(kf_times)], axis=1)
+        # Extract ground truth section corresponding to the expanded time window
+        gt_full = self._ground_truth
+        gt_section = [state for state in gt_full if candidate_start <= state[0] <= candidate_end]
+        if len(gt_section) < 2:
+            # Not enough GT points in the window; fall back to the full GT for interpolation.
+            gt_times = np.array([state[0] for state in gt_full])
+            gt_positions = np.array([state[1:4] for state in gt_full])
+        else:
+            gt_times = np.array([state[0] for state in gt_section])
+            gt_positions = np.array([state[1:4] for state in gt_section])
 
-        position_errors = kf_positions - gps_interp_positions
+        candidate_times = np.array([state[0] for state in candidate_trajectory])
+        candidate_positions = np.array([state[1:4] for state in candidate_trajectory])
+
+        # Interpolate the ground truth positions at the candidate timestamps.
+        interp_east = interp1d(gt_times, gt_positions[:, 0], kind='linear', fill_value="extrapolate")
+        interp_north = interp1d(gt_times, gt_positions[:, 1], kind='linear', fill_value="extrapolate")
+        interp_alt = interp1d(gt_times, gt_positions[:, 2], kind='linear', fill_value="extrapolate")
+        gt_interp_positions = np.stack([interp_east(candidate_times),
+                                        interp_north(candidate_times),
+                                        interp_alt(candidate_times)], axis=1)
+
+        # Compute error metrics.
+        position_errors = candidate_positions - gt_interp_positions
         euclidean_errors = np.linalg.norm(position_errors, axis=1)
         total_position_rmse = np.sqrt(np.mean(euclidean_errors**2))
 
-        # print(f"Accuracy Calculation Complete:")
-        # print(f"  - Compared {len(sf_KF_state_with_time)} KF states to closest GPS points.")
-        # print(f"  - RMSE X: {rmse_x:.4f} meters")
-        # print(f"  - RMSE Y: {rmse_y:.4f} meters")
-        # print(f"  - RMSE Z: {rmse_z:.4f} meters")
-        # print(f"  - Overall Position RMSE: {total_position_rmse:.4f} meters")
-        # return {
-        #         'total_position_rmse': total_position_rmse,
-        #         'position_errors': position_errors,
-        #         'euclidean_errors': euclidean_errors,
-        #         'kf_times': kf_times,
-        #         'kf_positions': kf_positions,
-        #         'gps_interp_positions': gps_interp_positions
-        #     }
-        return total_position_rmse
+        return {
+            'total_position_rmse': total_position_rmse,
+            'position_errors': position_errors,
+            'euclidean_errors': euclidean_errors,
+            'candidate_times': candidate_times,
+            'candidate_positions': candidate_positions,
+            'ground_truth_interp': gt_interp_positions,
+            'gt_start_time': candidate_start,
+            'gt_end_time': candidate_end
+        }
 
-    def run_sampled_brute_force_kalman_filter(self, start_idx=0, end_idx=None, overwrite_sampling_freq=None, max_combos_in_memory=1000):
+    def run_sampled_brute_force_kalman_filter(self, start_idx=0, end_idx=None, overwrite_sampling_freq=None, max_combos_in_memory=500):
+        """
+        Zombie-resistant brute force implementation.
+        """
         from itertools import product, islice
+        
+        # Set up signal handling to prevent zombies
+        def signal_handler(signum, frame):
+            print(f"\nReceived signal {signum}, cleaning up...")
+            sys.exit(1)
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
         class_args = {
             'get_state_transition_matrix': self.get_state_transition_matrix,
             'get_process_noise_covariance_matrix': self.get_process_noise_covariance_matrix,
@@ -841,42 +1009,39 @@ class KF_SensorFusion:
             'calculate_accuracy_metrics': self.calculate_accuracy_metrics,
         }
 
+        # Initialize state and covariance
         xt = np.zeros(15)
         Pt = np.diag([1000]*3 + [100]*3 + [100]*3 + [100]*3 + [1000]*3)
-        I = np.eye(15)
 
         if end_idx is None:
             end_idx = len(self.indexed_sensor_data)
 
+        # Find first GPS measurement to initialize
         gps_started = False
         previous_time = None
         sensor_data_queues = []
-
-        # Step 1: Collect all sensor_data_queues (one per sampling period)
         sensor_data_queue = []
+        
         for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data[start_idx:end_idx]):
             if not gps_started and sensor_type == 'GPS':
                 xt[0] = sensor_data['easting']
-                xt[1] = sensor_data['northing']
+                xt[1] = sensor_data['northing']  
                 xt[2] = sensor_data['altitude']
                 gps_started = True
                 previous_time = time
             if not gps_started:
-                print("WARN: No GPS measurement found in the sensor subset.")
                 continue
-
-            if (overwrite_sampling_freq is not None):
-                processing_frequency = overwrite_sampling_freq
-            else:
-                processing_frequency = self.processing_frequency
-
+                
+            processing_frequency = overwrite_sampling_freq if (overwrite_sampling_freq is not None) else self.processing_frequency
+            
+            # Collect measurements within each time window
             if time - previous_time < 1/processing_frequency:
                 sensor_data_queue.append((index, sensor_type, time, sensor_data))
                 continue
-
+                
             if len(sensor_data_queue) == 0:
                 sensor_data_queue.append((index, sensor_type, time, sensor_data))
-
+                
             sensor_data_queues.append(sensor_data_queue.copy())
             sensor_data_queue = []
             previous_time = time
@@ -887,65 +1052,270 @@ class KF_SensorFusion:
             print("Warning: At least one queue is empty, no combinations possible.")
             return None
 
-        log_total_combos = sum(math.log10(l) for l in queue_lengths)
-        if log_total_combos > 12:
-            total_combos = 1
-            for l in queue_lengths:
-                total_combos *= l
-            total_combos_decimal = decimal.Decimal(total_combos)
-            print(f"Total combinations: {total_combos_decimal:.2E} (too large to enumerate in memory)")
-        else:
-            total_combos = 1
-            for l in queue_lengths:
-                total_combos *= l
-            print(f"Total combinations: {total_combos}")
-
+        total_combos = 1
+        for l in queue_lengths:
+            total_combos *= l
+        print(f"Total combinations: {total_combos}")
+            
+        # Conservative settings to prevent zombie accumulation
+        num_workers = 50  # Very conservative
+        chunk_size = max(50, max_combos_in_memory // num_workers - 1)
+        
+        print(f"Using {num_workers} workers with chunk size {chunk_size}")
+        
         best_metric = float('inf')
         best_trajectory = None
         best_sensors = None
         best_state = None
         best_cov = None
-
+        
         def combo_generator():
             return product(*sensor_data_queues)
-
-        processed = 0
-        chunk_size = max_combos_in_memory
+        
+        # Use regular multiprocessing.Pool instead of ProcessPoolExecutor
+        # This gives us better control over process lifecycle
         combos = combo_generator()
-        print("Beginning brute force search...")
-        print(f"Total combinations to process: {total_combos}")
-
-        # Use all available CPU cores
-        # num_workers = multiprocessing.cpu_count()
-        print("Total number of cpu cores available: ", multiprocessing.cpu_count())
-        num_workers = 50
-        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = []
-            chunk_list = []
-            while True:
-                chunk = list(islice(combos, chunk_size))
-                if not chunk:
-                    break
-                futures.append(executor.submit(evaluate_combo_chunk_worker, chunk, xt, Pt, class_args))
-                chunk_list.append(len(chunk))  # Track chunk sizes for progress
-
-            # Use tqdm to show progress
-            with tqdm(total=total_combos, desc="Processing combinations") as pbar:
-                for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                    results = future.result()
-                    for metric, traj, combo, xt_bf, Pt_bf in results:
-                        if metric is not None and metric < best_metric:
-                            best_metric = metric
-                            best_trajectory = traj
-                            best_sensors = combo
-                            best_state = xt_bf
-                            best_cov = Pt_bf
-                    processed += chunk_list[i]
-                    pbar.update(chunk_list[i])
-
+        processed = 0
+        
+        try:
+            print("Starting multiprocessing pool...")
+            with Pool(processes=num_workers) as pool:
+                with tqdm(total=total_combos, desc="Brute force progress") as pbar:
+                    while True:
+                        chunk = list(islice(combos, chunk_size))
+                        if not chunk:
+                            break
+                        
+                        # Submit work and get results immediately (blocking)
+                        # This prevents accumulation of zombie processes
+                        try:
+                            result = pool.apply_async(
+                                evaluate_combo_chunk_worker,
+                                (chunk, xt, Pt, class_args)
+                            )
+                            
+                            # Get result with timeout to prevent hanging
+                            chunk_results = result.get(timeout=300)  # 5 minute timeout
+                            
+                            for metric, traj, combo, xt_bf, Pt_bf in chunk_results:
+                                if metric is not None and metric < best_metric:
+                                    best_metric = metric
+                                    best_trajectory = traj
+                                    best_sensors = combo
+                                    best_state = xt_bf
+                                    best_cov = Pt_bf
+                            
+                            processed += len(chunk)
+                            pbar.update(len(chunk))
+                            
+                            # Force garbage collection after each chunk
+                            import gc
+                            gc.collect()
+                            
+                        except mp.TimeoutError:
+                            print(f"\nChunk timed out, skipping...")
+                            continue
+                        except Exception as e:
+                            print(f"\nError processing chunk: {e}")
+                            continue
+                
+                print(f"\nProcessed {processed} combinations total")
+                
+            # Explicitly wait for all processes to terminate
+            print("Waiting for all processes to terminate...")
+            
+        except KeyboardInterrupt:
+            print("\nInterrupted by user, cleaning up...")
+            return None
+        except Exception as e:
+            print(f"Error in multiprocessing: {e}")
+            return None
+        finally:
+            # Additional cleanup
+            import gc
+            gc.collect()
+        
         print("Brute force search complete.")
         return {
-            'selected_sensor_measurements': best_sensors,
+            'selected_sensors': best_sensors,
+            'final_state': best_state,
+            'final_covariance': best_cov,
+            'trajectory': best_trajectory,
+            'accuracy_metric': best_metric
+        }
+    
+    def run_brute_force_kalman_filter_no_sampling(self, start_idx=0, end_idx=None, max_combos_in_memory=500):
+        """
+        Brute force implementation that processes all sensor measurements without sampling frequency constraints.
+        Each sensor measurement becomes a separate choice in the combination space.
+        """
+        from itertools import product, islice
+        
+        # Set up signal handling to prevent zombies
+        def signal_handler(signum, frame):
+            print(f"\nReceived signal {signum}, cleaning up...")
+            sys.exit(1)
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        class_args = {
+            'get_state_transition_matrix': self.get_state_transition_matrix,
+            'get_process_noise_covariance_matrix': self.get_process_noise_covariance_matrix,
+            'predict_covariance': self.predict_covariance,
+            'get_gps_observation_matrix': self.get_gps_observation_matrix,
+            'get_gps_measurement_noise_covariance_matrix': self.get_gps_measurement_noise_covariance_matrix,
+            'get_imu_observation_matrix': self.get_imu_observation_matrix,
+            'get_imu_measurement_noise_covariance_matrix': self.get_imu_measurement_noise_covariance_matrix,
+            'calculate_kalman_gain': self.calculate_kalman_gain,
+            'calculate_accuracy_metrics': self.calculate_accuracy_metrics,
+        }
+
+        # Initialize state and covariance
+        xt = np.zeros(15)
+        Pt = np.array([
+            [10000, 0, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 10000, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 10000,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        1000, 0, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 1000, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 1000,     0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     1000, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 1000, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 1000,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    1000, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 1000, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 1000,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      10000, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 10000, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 0, 10000],
+        ])
+
+        if end_idx is None:
+            end_idx = len(self.indexed_sensor_data)
+
+        # Find first GPS measurement to initialize
+        gps_started = False
+        sensor_measurements = []
+        
+        for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data[start_idx:end_idx]):
+            if not gps_started and sensor_type == 'GPS':
+                xt[0] = sensor_data['easting']
+                xt[1] = sensor_data['northing']  
+                xt[2] = sensor_data['altitude']
+                gps_started = True
+            if not gps_started:
+                continue
+                
+            # Add each sensor measurement as a potential choice
+            sensor_measurements.append((index, sensor_type, time, sensor_data))
+
+        if len(sensor_measurements) == 0:
+            print("No sensor measurements found after GPS initialization.")
+            return None
+
+        # Create groups of measurements that could be processed together
+        # For simplicity, we'll create binary choices: include or exclude each measurement
+        # This creates 2^n combinations where n is the number of measurements
+        n_measurements = len(sensor_measurements)
+        
+        # Limit the number of measurements to prevent exponential explosion
+        # if n_measurements > 20:  # 2^20 = ~1 million combinations
+        #     print(f"Too many measurements ({n_measurements}). Limiting to first 20 to prevent exponential explosion.")
+        #     sensor_measurements = sensor_measurements[:20]
+        #     n_measurements = 20
+
+        total_combos = 2 ** n_measurements
+        print(f"Total combinations: {total_combos} (2^{n_measurements})")
+        
+        # if total_combos > 1000000:  # 1 million combinations limit
+        #     print("Too many combinations. Consider reducing the measurement count or using sampling.")
+        #     return None
+            
+        # Conservative settings to prevent zombie accumulation
+        num_workers = 50
+        chunk_size = max(50, max_combos_in_memory // num_workers - 5)
+        
+        print(f"Using {num_workers} workers with chunk size {chunk_size}")
+        
+        best_metric = float('inf')
+        best_trajectory = None
+        best_sensors = None
+        best_state = None
+        best_cov = None
+        
+        def combo_generator():
+            """Generate all possible combinations of including/excluding each measurement."""
+            for i in range(total_combos):
+                combo = []
+                for j in range(n_measurements):
+                    if i & (1 << j):  # Check if j-th bit is set
+                        combo.append(sensor_measurements[j])
+                if len(combo) > 0:  # Only yield non-empty combinations
+                    yield tuple(combo)
+        
+        # Use regular multiprocessing.Pool instead of ProcessPoolExecutor
+        combos = combo_generator()
+        processed = 0
+        
+        try:
+            print("Starting multiprocessing pool...")
+            with Pool(processes=num_workers) as pool:
+                with tqdm(total=total_combos, desc="Brute force progress") as pbar:
+                    while True:
+                        chunk = list(islice(combos, chunk_size))
+                        if not chunk:
+                            break
+                        
+                        try:
+                            result = pool.apply_async(
+                                evaluate_combo_chunk_worker,
+                                (chunk, xt, Pt, class_args)
+                            )
+                            
+                            # Get result with timeout to prevent hanging
+                            chunk_results = result.get(timeout=300)  # 5 minute timeout
+                            
+                            for metric, traj, combo, xt_bf, Pt_bf in chunk_results:
+                                if metric is not None and metric < best_metric:
+                                    best_metric = metric
+                                    best_trajectory = traj
+                                    best_sensors = combo
+                                    best_state = xt_bf
+                                    best_cov = Pt_bf
+                            
+                            processed += len(chunk)
+                            pbar.update(len(chunk))
+                            
+                            # Force garbage collection after each chunk
+                            import gc
+                            gc.collect()
+                            
+                        except mp.TimeoutError:
+                            print(f"\nChunk timed out, skipping...")
+                            continue
+                        except Exception as e:
+                            print(f"\nError processing chunk: {e}")
+                            continue
+                
+                print(f"\nProcessed {processed} combinations total")
+                
+            print("Waiting for all processes to terminate...")
+            
+        except KeyboardInterrupt:
+            print("\nInterrupted by user, cleaning up...")
+            return None
+        except Exception as e:
+            print(f"Error in multiprocessing: {e}")
+            return None
+        finally:
+            # Additional cleanup
+            import gc
+            gc.collect()
+        
+        print("Brute force search complete.")
+        return {
+            'selected_sensors': best_sensors,
             'final_state': best_state,
             'final_covariance': best_cov,
             'trajectory': best_trajectory,
@@ -959,27 +1329,27 @@ class KF_SensorFusion:
         # [x, y, z, roll, pitch, yaw, v_x, v_y, v_z, angular_x, angular_y, angular_z, a_x, a_y, a_z]
         xt = np.array([0, 0, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0,    0, 0, 0])
         Pt = np.array([
-                        [1000, 0, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],       # x
-                        [0, 1000, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],       # y
-                        [0, 0, 1000,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],       # z
-                        [0, 0, 0,        100, 0, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],       # roll
-                        [0, 0, 0,        0, 100, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],       # pitch
-                        [0, 0, 0,        0, 0, 100,     0, 0, 0,    0, 0, 0,    0, 0, 0],       # yaw
-                        [0, 0, 0,        0, 0, 0,     100, 0, 0,    0, 0, 0,    0, 0, 0],       # v_x
-                        [0, 0, 0,        0, 0, 0,     0, 100, 0,    0, 0, 0,    0, 0, 0],       # v_y
-                        [0, 0, 0,        0, 0, 0,     0, 0, 100,    0, 0, 0,    0, 0, 0],       # v_z
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    100, 0, 0,    0, 0, 0],       # angular_x
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 100, 0,    0, 0, 0],       # angular_y
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 100,    0, 0, 0],       # angular_z
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      1000, 0, 0],    # a_x
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 1000, 0],    # a_y
-                        [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 0, 1000],    # a_z
-                    ])
+            [10000, 0, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 10000, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 10000,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        1000, 0, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 1000, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 1000,     0, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     1000, 0, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 1000, 0,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 1000,    0, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    1000, 0, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 1000, 0,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 1000,    0, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      10000, 0, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 10000, 0],
+            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 0, 10000],
+        ])
         I = np.eye(15)  # 8x8 Identity matrix
 
         # List to store dead-reckoned IMU estimates
         deadreckoned_IMU_estimates = []
-# unbias_entry = entry[:1] + [roll, pitch, yaw] + unbias_angular_velocity.tolist() + unbias_linear_acceleration.tolist() + entry[11:]             
+        # unbias_entry = entry[:1] + [roll, pitch, yaw] + unbias_angular_velocity.tolist() + unbias_linear_acceleration.tolist() + entry[11:]             
         previous_time = None
         # for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data):
             
@@ -1212,50 +1582,248 @@ class KF_SensorFusion:
         """Returns the UTM data."""
         return self.utm_data
 
+    def plot_covariance_evolution(self, sf_KF_state, sf_KF_covariance, save_path='covariance_evolution.png'):
+        """
+        Plot the evolution of covariance over time for the Kalman Filter.
+        
+        Args:
+            sf_KF_state: List of state tuples (time, x, y, z, roll, pitch, yaw)
+            sf_KF_covariance: List of 15x15 covariance matrices
+            save_path: Path to save the plot
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        if len(sf_KF_state) != len(sf_KF_covariance):
+            print("State and covariance lists must have the same length")
+            return
+        
+        # Extract timestamps
+        times = np.array([state[0] for state in sf_KF_state])
+        times = (times - times[0]) / 60  # Convert to minutes from start
+        
+        # Extract diagonal elements (variances) for key states
+        position_vars = np.array([[cov[0,0], cov[1,1], cov[2,2]] for cov in sf_KF_covariance])  # x, y, z variances
+        orientation_vars = np.array([[cov[3,3], cov[4,4], cov[5,5]] for cov in sf_KF_covariance])  # roll, pitch, yaw variances
+        velocity_vars = np.array([[cov[6,6], cov[7,7], cov[8,8]] for cov in sf_KF_covariance])  # vx, vy, vz variances
+        
+        # Convert variances to standard deviations for better interpretation
+        position_stds = np.sqrt(position_vars)
+        orientation_stds = np.sqrt(orientation_vars) * 180 / np.pi  # Convert to degrees
+        velocity_stds = np.sqrt(velocity_vars)
+        
+        # Create subplot layout
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        fig.suptitle('Kalman Filter Uncertainty Evolution Over Time', fontsize=16)
+        
+        # Position uncertainties
+        axes[0,0].plot(times, position_stds[:, 0], label='X (East)', color='red', alpha=0.8)
+        axes[0,0].plot(times, position_stds[:, 1], label='Y (North)', color='green', alpha=0.8)
+        axes[0,0].plot(times, position_stds[:, 2], label='Z (Altitude)', color='blue', alpha=0.8)
+        axes[0,0].set_ylabel('Position Std Dev (meters)')
+        axes[0,0].set_title('Position Uncertainty')
+        axes[0,0].legend()
+        axes[0,0].grid(True, alpha=0.3)
+        axes[0,0].set_yscale('log')
+        
+        # Orientation uncertainties
+        axes[0,1].plot(times, orientation_stds[:, 0], label='Roll', color='red', alpha=0.8)
+        axes[0,1].plot(times, orientation_stds[:, 1], label='Pitch', color='green', alpha=0.8)
+        axes[0,1].plot(times, orientation_stds[:, 2], label='Yaw', color='blue', alpha=0.8)
+        axes[0,1].set_ylabel('Orientation Std Dev (degrees)')
+        axes[0,1].set_title('Orientation Uncertainty')
+        axes[0,1].legend()
+        axes[0,1].grid(True, alpha=0.3)
+        axes[0,1].set_yscale('log')
+        
+        # Velocity uncertainties
+        axes[1,0].plot(times, velocity_stds[:, 0], label='Vx', color='red', alpha=0.8)
+        axes[1,0].plot(times, velocity_stds[:, 1], label='Vy', color='green', alpha=0.8)
+        axes[1,0].plot(times, velocity_stds[:, 2], label='Vz', color='blue', alpha=0.8)
+        axes[1,0].set_xlabel('Time (minutes)')
+        axes[1,0].set_ylabel('Velocity Std Dev (m/s)')
+        axes[1,0].set_title('Velocity Uncertainty')
+        axes[1,0].legend()
+        axes[1,0].grid(True, alpha=0.3)
+        axes[1,0].set_yscale('log')
+        
+        # Overall uncertainty metric (trace of position covariance)
+        total_position_uncertainty = np.sqrt(position_vars.sum(axis=1))
+        axes[1,1].plot(times, total_position_uncertainty, color='purple', linewidth=2)
+        axes[1,1].set_xlabel('Time (minutes)')
+        axes[1,1].set_ylabel('Total Position Uncertainty (m)')
+        axes[1,1].set_title('Overall Position Uncertainty')
+        axes[1,1].grid(True, alpha=0.3)
+        axes[1,1].set_yscale('log')
+        
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Covariance evolution plot saved to {save_path}")
+        # plt.show()
 
-def plot_brute_force_vs_standard(utm_data, best_set, standard_kf_trajectory, start_idx, start_offset):
-    # Get the timestamps from indexed_sensor_data for the start and end indices
-    start_time = sensor_fusion.indexed_sensor_data[start_idx][2]
-    end_time = sensor_fusion.indexed_sensor_data[start_idx + start_offset][2]
+    def plot_covariance_heatmap(self, sf_KF_covariance, time_indices=None, save_path='covariance_heatmap.png'):
+        """
+        Plot heatmaps of covariance matrices at specific time points.
+        
+        Args:
+            sf_KF_covariance: List of 15x15 covariance matrices
+            time_indices: List of time indices to plot (default: start, middle, end)
+            save_path: Path to save the plot
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        if time_indices is None:
+            n_cov = len(sf_KF_covariance)
+            time_indices = [0, n_cov//2, n_cov-1]  # Start, middle, end
+        
+        # State variable labels
+        state_labels = ['X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw', 
+                    'Vx', 'Vy', 'Vz', 'ωx', 'ωy', 'ωz', 'ax', 'ay', 'az']
+        
+        fig, axes = plt.subplots(1, len(time_indices), figsize=(5*len(time_indices), 4))
+        if len(time_indices) == 1:
+            axes = [axes]
+        
+        for i, time_idx in enumerate(time_indices):
+            cov_matrix = sf_KF_covariance[time_idx]
+            
+            # Create correlation matrix for better visualization
+            std_devs = np.sqrt(np.diag(cov_matrix))
+            correlation_matrix = cov_matrix / np.outer(std_devs, std_devs)
+            
+            im = axes[i].imshow(correlation_matrix, cmap='RdBu_r', vmin=-1, vmax=1)
+            axes[i].set_title(f'Correlation Matrix at Step {time_idx}')
+            axes[i].set_xticks(range(15))
+            axes[i].set_yticks(range(15))
+            axes[i].set_xticklabels(state_labels, rotation=45)
+            axes[i].set_yticklabels(state_labels)
+            
+            # Add colorbar
+            plt.colorbar(im, ax=axes[i], shrink=0.8)
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Covariance heatmap saved to {save_path}")
+        # plt.show()
 
-    # Find the closest GPS entries in UTM data for these times
-    gps_times = [entry['time'] for entry in utm_data]
-    def find_closest_gps_idx(target_time):
-        return min(range(len(gps_times)), key=lambda i: abs(gps_times[i] - target_time))
-    gps_idx_start = find_closest_gps_idx(start_time)
-    gps_idx_end = find_closest_gps_idx(end_time)
-    gps_start = utm_data[gps_idx_start]
-    gps_end = utm_data[gps_idx_end]
-    center_easting = (gps_start['easting'] + gps_end['easting']) / 2
-    center_northing = (gps_start['northing'] + gps_end['northing']) / 2
+    def plot_uncertainty_ellipses_2d(self, sf_KF_state, sf_KF_covariance, confidence_level=0.95, 
+                                    skip_rate=10, save_path='uncertainty_ellipses.png'):
+        """
+        Plot 2D trajectory with uncertainty ellipses showing position confidence.
+        
+        Args:
+            sf_KF_state: List of state tuples (time, x, y, z, roll, pitch, yaw)
+            sf_KF_covariance: List of 15x15 covariance matrices
+            confidence_level: Confidence level for ellipses (0.95 = 95%)
+            skip_rate: Plot every skip_rate-th ellipse to avoid clutter
+            save_path: Path to save the plot
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Ellipse
+        import numpy as np
+        from scipy.stats import chi2
+        
+        # Extract positions
+        positions = np.array([[state[1], state[2]] for state in sf_KF_state])  # x, y positions
+        
+        fig, ax = plt.subplots(figsize=(12, 10))
+        
+        # Plot trajectory
+        ax.plot(positions[:, 0], positions[:, 1], 'b-', linewidth=2, alpha=0.7, label='Estimated Trajectory')
+        
+        # Chi-square value for confidence level
+        chi2_val = chi2.ppf(confidence_level, df=2)  # 2 DOF for x,y position
+        
+        # Plot uncertainty ellipses
+        for i in range(0, len(sf_KF_covariance), skip_rate):
+            # Extract 2x2 position covariance submatrix
+            pos_cov = sf_KF_covariance[i][:2, :2]  # x,y covariance
+            
+            # Compute eigenvalues and eigenvectors
+            eigenvals, eigenvecs = np.linalg.eigh(pos_cov)
+            
+            # Compute ellipse parameters
+            angle = np.degrees(np.arctan2(eigenvecs[1, 0], eigenvecs[0, 0]))
+            width = 2 * np.sqrt(chi2_val * eigenvals[0])
+            height = 2 * np.sqrt(chi2_val * eigenvals[1])
+            
+            # Create ellipse
+            ellipse = Ellipse(positions[i], width, height, angle=angle, 
+                            fill=False, edgecolor='red', alpha=0.5, linewidth=1)
+            ax.add_patch(ellipse)
+        
+        # Add GPS reference data if available
+        if hasattr(self, 'utm_data'):
+            eastings = [data['easting'] for data in self.utm_data]
+            northings = [data['northing'] for data in self.utm_data]
+            ax.scatter(eastings, northings, c='green', marker='.', s=1, alpha=0.3, label='GPS Reference')
+        
+        ax.set_xlabel('Easting (m)')
+        ax.set_ylabel('Northing (m)')
+        ax.set_title(f'2D Trajectory with {confidence_level*100:.0f}% Confidence Ellipses')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        ax.axis('equal')
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Uncertainty ellipses plot saved to {save_path}")
+        # plt.show()
 
-    # Extract trajectories
-    bf_traj = best_set['trajectory']
+
+def plot_brute_force_centered_comparison(utm_data, best_set, standard_kf_trajectory):
+    # Extract standard KF trajectory and its center
     std_traj = standard_kf_trajectory
-    bf_X = [state[1] for state in bf_traj]
-    bf_Y = [state[2] for state in bf_traj]
     std_X = [state[1] for state in std_traj]
     std_Y = [state[2] for state in std_traj]
+    center_easting = (min(std_X) + max(std_X)) / 2
+    center_northing = (min(std_Y) + max(std_Y)) / 2
 
-    # GPS for reference (using the range between the two GPS indices)
+    # Extract brute force KF trajectory (this will be the primary trajectory for centering)
+    bf_traj = best_set['trajectory']
+    bf_X = [state[1] for state in bf_traj]
+    bf_Y = [state[2] for state in bf_traj]
+
+    # GPS for reference (using time range of the standard KF trajectory)
+    gps_times = [entry['time'] for entry in utm_data]
+    std_times = [state[0] for state in std_traj]
+    def find_closest_gps_idx(target_time):
+        return min(range(len(gps_times)), key=lambda i: abs(gps_times[i] - target_time))
+    gps_idx_start = find_closest_gps_idx(std_times[0])
+    gps_idx_end = find_closest_gps_idx(std_times[-1])
     gps_X = [utm_data[i]['easting'] for i in range(min(gps_idx_start, gps_idx_end), max(gps_idx_start, gps_idx_end) + 1)]
     gps_Y = [utm_data[i]['northing'] for i in range(min(gps_idx_start, gps_idx_end), max(gps_idx_start, gps_idx_end) + 1)]
 
+    # Calculate bounds based primarily on the best set trajectory (brute force KF)
+    min_x_bf, max_x_bf = min(bf_X), max(bf_X)
+    min_y_bf, max_y_bf = min(bf_Y), max(bf_Y)
+    
+    # Add minimal padding (5% of the range) to maximize screen usage
+    x_range = max_x_bf - min_x_bf
+    y_range = max_y_bf - min_y_bf
+    padding = 0.9  # 40% padding to maximize screen usage
+    
+    x_padding = x_range * padding
+    y_padding = y_range * padding
+
     plt.figure(figsize=(10, 8))
-    plt.scatter(gps_X, gps_Y, label='GPS Reference', c='black', s=10, alpha=0.5)
-    plt.plot(bf_X, bf_Y, label='Brute Force KF', color='blue', linewidth=2)
+    plt.plot(gps_X, gps_Y, label='GPS Ground Truth', color='black', alpha=0.5, linestyle='--')
     plt.plot(std_X, std_Y, label='Standard KF', color='orange', linewidth=2, linestyle='--')
+    plt.plot(bf_X, bf_Y, label='Brute Force KF (Best Set)', color='blue', linewidth=1, linestyle='--')  # Thicker line for emphasis
     plt.xlabel('Easting')
     plt.ylabel('Northing')
-    plt.title('Brute Force vs Standard KF Trajectory')
+    plt.title('Brute Force KF Trajectory Centered (Best Set Optimized)')
     plt.legend()
     plt.grid(True)
-    # Center window around the midpoint of the GPS segment
-    window_size = 5  # meters, adjust as needed
-    plt.xlim(center_easting - window_size, center_easting + window_size)
-    plt.ylim(center_northing - window_size, center_northing + window_size)
+    
+    # Set limits to show entire trajectory with minimal padding, centered on best set
+    plt.xlim(min_x_bf - x_padding, max_x_bf + x_padding)
+    plt.ylim(min_y_bf - y_padding, max_y_bf + y_padding)
+    
     plt.tight_layout()
-    plt.show()
+    # plt.show()
+    plt.savefig("brute_force_centered_trajectory_plot.png")
 
 def plot_kf_centered_comparison(utm_data, best_set, standard_kf_trajectory):
     # Extract standard KF trajectory and its center
@@ -1280,8 +1848,23 @@ def plot_kf_centered_comparison(utm_data, best_set, standard_kf_trajectory):
     gps_X = [utm_data[i]['easting'] for i in range(min(gps_idx_start, gps_idx_end), max(gps_idx_start, gps_idx_end) + 1)]
     gps_Y = [utm_data[i]['northing'] for i in range(min(gps_idx_start, gps_idx_end), max(gps_idx_start, gps_idx_end) + 1)]
 
+    # Calculate bounds for all trajectories
+    all_X = std_X + bf_X + gps_X
+    all_Y = std_Y + bf_Y + gps_Y
+    
+    min_x, max_x = min(all_X), max(all_X)
+    min_y, max_y = min(all_Y), max(all_Y)
+    
+    # Add padding (10% of the range)
+    x_range = max_x - min_x
+    y_range = max_y - min_y
+    padding = 0.9  # 90% padding
+    
+    x_padding = x_range * padding
+    y_padding = y_range * padding
+
     plt.figure(figsize=(10, 8))
-    plt.scatter(gps_X, gps_Y, label='GPS Reference', c='black', s=10, alpha=0.5)
+    plt.scatter(gps_X, gps_Y, label='GPS Reference', c='black', alpha=0.5, linestyle='-')
     plt.plot(bf_X, bf_Y, label='Brute Force KF', color='blue', linewidth=2)
     plt.plot(std_X, std_Y, label='Standard KF', color='orange', linewidth=2, linestyle='--')
     plt.xlabel('Easting')
@@ -1289,12 +1872,48 @@ def plot_kf_centered_comparison(utm_data, best_set, standard_kf_trajectory):
     plt.title('Brute Force vs Standard KF Trajectory')
     plt.legend()
     plt.grid(True)
-    # Center window around the midpoint of the standard KF segment
-    window_size = 500  # meters, adjust as needed
-    plt.xlim(center_easting - window_size, center_easting + window_size)
-    plt.ylim(center_northing - window_size, center_northing + window_size)
+    
+    # Set limits to show entire trajectory with padding
+    plt.xlim(min_x - x_padding, max_x + x_padding)
+    plt.ylim(min_y - y_padding, max_y + y_padding)
+    
     plt.tight_layout()
-    plt.show()
+    # plt.show()
+    plt.savefig("kf_centered_trajectory_plot.png")
+
+def plot_log_determinant(sf_KF_state, sf_KF_log_det, save_path='log_determinant_evolution.png'):
+    """
+    Plots the log determinant of the covariance matrix over time.
+
+    Args:
+        sf_KF_state (list): The list of state tuples containing timestamps.
+        sf_KF_log_det (list): The list of log determinant values.
+        save_path (str): The path to save the plot image.
+    """
+    if not sf_KF_state or not sf_KF_log_det:
+        print("State or log determinant data is empty. Cannot plot.")
+        return
+
+    # Extract timestamps and make them relative to the start time
+    times = np.array([state[0] for state in sf_KF_state])
+    relative_times = times - times[0]
+
+    # Create the plot
+    plt.figure(figsize=(14, 7))
+    plt.plot(relative_times, sf_KF_log_det, color='purple', linewidth=2)
+    
+    plt.xlabel('Time (seconds)')
+    plt.ylabel('Log Determinant of Covariance (log det(P))')
+    plt.title('Evolution of Covariance Uncertainty Over Time')
+    plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+    plt.tight_layout()
+    plt.ylim(-40, -30)
+    plt.xlim(130, 135)
+    
+    # Save the plot
+    plt.savefig(save_path, dpi=300)
+    print(f"Log determinant plot saved to {save_path}")
+    # plt.show()
 
 # main code
 if __name__ == "__main__":
@@ -1323,61 +1942,49 @@ if __name__ == "__main__":
     # Combine GPS and IMU data and sort by timestamp
     sensor_fusion.combine_sensor_data()
 
+    # Calculate ground truth based on using all avalilable GPS data
+    print("Calculating Ground Truth...")
+    sf_KF_state, sf_KF_covariance, sf_KF_log_det = sensor_fusion.run_kalman_filter_full()
+
+    # sensor_fusion.plot_covariance_evolution(sf_KF_state, sf_KF_covariance)
+    # sensor_fusion.plot_covariance_heatmap(sf_KF_covariance)
+    # sensor_fusion.plot_uncertainty_ellipses_2d(sf_KF_state, sf_KF_covariance)
+    plot_log_determinant(sf_KF_state, sf_KF_log_det)
+    print("Ground Truth Calculation Complete!")
+
     # Run Kalman filter for sensor fusion
     # sf_KF_state = sensor_fusion.run_kalman_filter_scheduled() # Output (Time Steps x 6) where stored values are (X, Y, Z, roll, pitch, yaw)
 
     # deadreckoned_IMU_estimates = sensor_fusion.run_dead_reckoning_for_IMU() # Output (Time Steps x 6) where stored values are (X, Y, Z, roll, pitch, yaw)
 
+    start_idx = 103000  # i1_t=0 i2_t=0.0001 g1_t=0.0006 i3 i4 ... i100 g40
+    start_offset = 50 
+    sampling_frq = 20
 
-    # Evaluate Kalman Filter performance with brute force search
-    # mi could be GPS measurement or IMU measurement # i is a index/number
+    # print("Running Brute Force KF with Sampling Frequency:", sampling_frq)
+    best_set = sensor_fusion.run_sampled_brute_force_kalman_filter(start_idx, start_idx + start_offset, sampling_frq)
+    # best_set = sensor_fusion.run_brute_force_kalman_filter_no_sampling(start_idx, start_idx + start_offset)
+    print("Brute Force - Accuracy Metric (Total Position RMSE):", best_set['accuracy_metric']) # Accuracy Metric (Total Position RMSE): 1.2345
+    print("Trajectory:", (best_set['trajectory'])) # Trajectory Length: 1412
+    print("Selected Sensors:", best_set['selected_sensors']) # Selected Sensors: [('i100', 'IMU', 10.0001, {...}), ('g40', 'GPS', 10.0006, {...})]
 
-    # [m1,m2,m3, ... m100000] # orignal measurements for trajectory
+    # output = sensor_fusion.run_kalman_filter(start_idx, start_idx + start_offset) # ONLY USE IMU, BROKEN
+    # print("Regular KF - Accuracy Metric (Total Position RMSE):", sensor_fusion.calculate_accuracy_metrics(output)) # Accuracy
 
-    # [m54717, ..., 54767] # selected portion of trajectory
+    # sensor_fusion.set_processing_frequency(sampling_frq) # Set to 50 Hz for comparison
+    # standard_kf_trajectory = sensor_fusion.run_kalman_filter_scheduled(start_idx, start_idx + start_offset)
+    # print("Accuracy Metric (Total Position RMSE):", sensor_fusion.calculate_accuracy_metrics(standard_kf_trajectory)) # Accuracy
 
-    # # Ex. Subsets of measurments sampled and to be evaluated
-    # 4/50 seconds
-    # [[mm54717_GPS, m54718_IMU, m54719_IMU], [m54720_IMU, m54721_IMU], [m54722_IMU, m54723_IMU], [m54724_GPS, m54725_IMU, m54726_IMU]]
-    
+    # Plotting
+    plot_kf_centered_comparison(sensor_fusion.get_utm_data(), best_set, sensor_fusion.get_GT())
+    plot_brute_force_centered_comparison(sensor_fusion.get_utm_data(), best_set, sensor_fusion.get_GT())
 
 
-    # [mm54717_GPS, m54720_IMU, m54722_IMU, m54724_GPS] --> calculate accuracy metric --> update best if better
-    # [mm54717_GPS, m54720_IMU, m54722_IMU, m54725_IMU] --> calculate accuracy metric --> update best if better
-    # [mm54717_GPS, m54720_IMU, m54722_IMU, m54726_IMU] --> calculate accuracy metric --> update best if better
 
-    # [mm54717_GPS, m54720_IMU, m54723_IMU, m54724_GPS] --> calculate accuracy metric --> update best if better
-    # [mm54717_GPS, m54720_IMU, m54723_IMU, m54725_IMU] --> calculate accuracy metric --> update best if better
-    # [mm54717_GPS, m54720_IMU, m54723_IMU, m54726_IMU] --> calculate accuracy metric --> update best if better
-    # # subset size is 2 or 3
+# kill $(pgrep -f "kf_workers.py")
+# ps aux | grep -E "(zombie|<defunct>)" | grep iseanps 
+# pkill -9 -u isean python3
+# pkill -u isean python3
+# python3 kf_workers.py
 
-    # start_offset * 1/sampling_frq = seconds of trajectory being processed/evaluated
-
-    start_idx = 54717  # i1_t=0 i2_t=0.0001 g1_t=0.0006 i3 i4 ... i100 g40
-    start_offset = 100
-    sampling_frq = 50
-
-    # UIOP
-    # I = GPS
-    # U = IMU
-    # P = Radar
-    # O = Images
-
-    # TIME                  # SENSOR MEASSURMENT SUBSET
-    # 0 - 1/50 (0 - 0.02) seconds      # U U I (0.019) I (0.0001)
-    # 1/50 - 2/50 seconds   # U U U P O O
-    # 2/50 - 3/50 seconds   # U P O I
-    # 3/50 - 4/50 seconds   # U U I P
-
-    # best_set = sensor_fusion.run_sampled_brute_force_kalman_filter(start_idx, start_idx + start_offset, sampling_frq)
-    # print("Brute Force - Accuracy Metric (Total Position RMSE):", best_set['accuracy_metric']) # Accuracy Metric (Total Position RMSE): 1.2345
-    
-    output = sensor_fusion.run_kalman_filter(start_idx, start_idx + start_offset) # ONLY USE IMU, BROKEN
-    print("Regular KF - Accuracy Metric (Total Position RMSE):", sensor_fusion.calculate_accuracy_metrics(output)) # Accuracy
-                # sf_KF_state.append((time, xt[0], xt[1], xt[2], xt[3], xt[4], xt[5]))  # Append initial state
-
-    sensor_fusion.set_processing_frequency(sampling_frq) # Set to 50 Hz for comparison
-    standard_kf_trajectory = sensor_fusion.run_kalman_filter_scheduled(start_idx, start_idx + start_offset)
-    
-    print("Accuracy Metric (Total Position RMSE):", sensor_fusion.calculate_accuracy_metrics(standard_kf_trajectory)) # Accuracy
-    # plot_kf_centered_comparison(sensor_fusion.get_utm_data(), best_set, standard_kf_trajectory)
+# Greedy value, if goes above -37
