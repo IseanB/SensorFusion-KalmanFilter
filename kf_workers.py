@@ -18,7 +18,7 @@ import math
 import decimal
 
 
-def evaluate_combo_chunk_worker(chunk, xt, Pt, class_args):
+def evaluate_combo_chunk_worker(chunk, xt, Pt, class_args, prev_time, last_time):
     """Worker function with better error handling and memory management."""
     results = []
     
@@ -28,10 +28,12 @@ def evaluate_combo_chunk_worker(chunk, xt, Pt, class_args):
                 xt_bf = xt.copy()
                 Pt_bf = Pt.copy()
                 traj = []
-                prev_time = None
+                log_det = []
+                # Use the passed-in prev_time for the first element of the combo
+                current_prev_time = prev_time 
                 
                 for (idx, stype, t, sdata) in combo:
-                    dt = t - prev_time if prev_time is not None else 0
+                    dt = t - current_prev_time if current_prev_time is not None else 0
                     F = class_args['get_state_transition_matrix'](dt)
                     Qt = class_args['get_process_noise_covariance_matrix'](dt)
                     xt_bf = np.dot(F, xt_bf)
@@ -48,10 +50,10 @@ def evaluate_combo_chunk_worker(chunk, xt, Pt, class_args):
                         Vz = xt_bf[8] + az * dt
                         X = xt_bf[0] + Vx * dt
                         Y = xt_bf[1] + Vy * dt
-                        Z = xt_bf[2] + Vz * dt
+                        Z_pos = xt_bf[2] + Vz * dt
                         roll, pitch, yaw = sdata[1], sdata[2], sdata[3]
                         ang_x, ang_y, ang_z = sdata[4], sdata[5], sdata[6]
-                        Z = [X, Y, Z, roll, pitch, yaw, Vx, Vy, Vz, ang_x, ang_y, ang_z, ax, ay, az]
+                        Z = [X, Y, Z_pos, roll, pitch, yaw, Vx, Vy, Vz, ang_x, ang_y, ang_z, ax, ay, az]
                         H = class_args['get_imu_observation_matrix']()
                         R = class_args['get_imu_measurement_noise_covariance_matrix']()
                     
@@ -60,8 +62,20 @@ def evaluate_combo_chunk_worker(chunk, xt, Pt, class_args):
                     xt_bf = xt_bf + np.dot(K, y)
                     Pt_bf = np.dot(np.eye(15) - np.dot(K, H), Pt_bf)
                     traj.append((t, *xt_bf[:6]))
-                    prev_time = t
+                    current_prev_time = t
+                    sign_log_det, value_log_det = np.linalg.slogdet(Pt_bf)
+                    log_det.append(sign_log_det * value_log_det)
                 
+                if current_prev_time is not None and current_prev_time < last_time:
+                    dt = last_time - current_prev_time
+                    F = class_args['get_state_transition_matrix'](dt)
+                    Qt = class_args['get_process_noise_covariance_matrix'](dt)
+                    xt_bf = np.dot(F, xt_bf)
+                    Pt_bf = class_args['predict_covariance'](Pt_bf, F, Qt)
+                    traj.append((last_time, *xt_bf[:6]))
+                    sign_log_det, value_log_det = np.linalg.slogdet(Pt_bf)
+                    log_det.append(sign_log_det * value_log_det)
+
                 # Calculate metric for this combination
                 try:
                     metric_result = class_args['calculate_accuracy_metrics'](traj)
@@ -74,7 +88,7 @@ def evaluate_combo_chunk_worker(chunk, xt, Pt, class_args):
                     metric = float('inf')
                 
                 # Only keep essential data to reduce memory usage
-                results.append((metric, traj, combo, xt_bf.copy(), None))  # Don't return covariance to save memory
+                results.append((metric, traj, combo, xt_bf.copy(), None, log_det, len(combo)))  # Don't return covariance to save memory
                 
             except Exception as combo_error:
                 print(f"Error processing combination: {combo_error}")
@@ -86,7 +100,7 @@ def evaluate_combo_chunk_worker(chunk, xt, Pt, class_args):
         return []  # Return empty results for this chunk
     
     return results
-
+    
 class Scheduler:
     """
     A class to represent a sensor scheduler.
@@ -1101,12 +1115,211 @@ class KF_SensorFusion:
             'gt_end_time': candidate_end
         }
 
-    def run_sampled_brute_force_kalman_filter(self, start_idx=0, end_idx=None, overwrite_sampling_freq=None, max_combos_in_memory=500):
+    # def run_sampled_brute_force_kalman_filter(self, start_idx=0, end_idx=None, overwrite_sampling_freq=None, R_threshold=None, max_combos_in_memory=500):
+    #     """
+    #     Zombie-resistant brute force implementation.
+    #     """
+    #     from itertools import product, islice
+
+    #     if R_threshold is None:
+    #         raise ValueError("R_threshold must be specified for brute force KF.")
+        
+    #     # Set up signal handling to prevent zombies
+    #     def signal_handler(signum, frame):
+    #         print(f"\nReceived signal {signum}, cleaning up...")
+    #         sys.exit(1)
+        
+    #     signal.signal(signal.SIGINT, signal_handler)
+    #     signal.signal(signal.SIGTERM, signal_handler)
+        
+    #     class_args = {
+    #         'get_state_transition_matrix': self.get_state_transition_matrix,
+    #         'get_process_noise_covariance_matrix': self.get_process_noise_covariance_matrix,
+    #         'predict_covariance': self.predict_covariance,
+    #         'get_gps_observation_matrix': self.get_gps_observation_matrix,
+    #         'get_gps_measurement_noise_covariance_matrix': self.get_gps_measurement_noise_covariance_matrix,
+    #         'get_imu_observation_matrix': self.get_imu_observation_matrix,
+    #         'get_imu_measurement_noise_covariance_matrix': self.get_imu_measurement_noise_covariance_matrix,
+    #         'calculate_kalman_gain': self.calculate_kalman_gain,
+    #         'calculate_accuracy_metrics': self.calculate_accuracy_metrics,
+    #     }
+
+    #     # Initialize state and covariance
+    #     xt = np.zeros(15)
+    #     Pt = np.diag([1000]*3 + [100]*3 + [100]*3 + [100]*3 + [1000]*3)
+
+    #     if end_idx is None:
+    #         end_idx = len(self.indexed_sensor_data)
+
+    #     # Find first GPS measurement to initialize
+    #     gps_started = False
+    #     previous_time = None
+    #     sensor_data_queues = []
+    #     sensor_data_queue = []
+        
+    #     for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data[start_idx:end_idx]):
+    #         if not gps_started and sensor_type == 'GPS':
+    #             xt[0] = sensor_data['easting']
+    #             xt[1] = sensor_data['northing']  
+    #             xt[2] = sensor_data['altitude']
+    #             gps_started = True
+    #             previous_time = time
+    #         if not gps_started:
+    #             continue
+                
+    #         processing_frequency = overwrite_sampling_freq if (overwrite_sampling_freq is not None) else self.processing_frequency
+            
+    #         # Collect measurements within each time window
+    #         if time - previous_time < 1/processing_frequency:
+    #             sensor_data_queue.append((index, sensor_type, time, sensor_data))
+    #             continue
+                
+    #         if len(sensor_data_queue) == 0:
+    #             sensor_data_queue.append((index, sensor_type, time, sensor_data))
+                
+    #         sensor_data_queues.append(sensor_data_queue.copy())
+    #         sensor_data_queue = []
+    #         previous_time = time
+
+    #     # Step 2: Brute force all possible combinations (one sensor per queue)
+    #     queue_lengths = [len(q) for q in sensor_data_queues]
+    #     if any(l == 0 for l in queue_lengths):
+    #         print("Warning: At least one queue is empty, no combinations possible.")
+    #         return None
+
+    #     total_combos = 1
+    #     for l in queue_lengths:
+    #         total_combos *= l
+    #     print(f"Total combinations: {total_combos}")
+            
+    #     # Conservative settings to prevent zombie accumulation
+    #     num_workers = 50  # Very conservative
+    #     chunk_size = max(50, max_combos_in_memory // num_workers - 1)
+        
+    #     print(f"Using {num_workers} workers with chunk size {chunk_size}")
+        
+    #     best_metric = float('inf')
+    #     best_trajectory = None
+    #     best_sensors = None
+    #     best_state = None
+    #     best_cov = None
+    #     best_log_det = None
+    #     best_num_measurements_used = float('inf')
+        
+    #     def combo_generator():
+    #         return product(*sensor_data_queues)
+        
+    #     # Use regular multiprocessing.Pool instead of ProcessPoolExecutor
+    #     # This gives us better control over process lifecycle
+    #     combos = combo_generator()
+    #     processed = 0
+        
+    #     try:
+    #         print("Starting multiprocessing pool...")
+    #         with Pool(processes=num_workers) as pool:
+    #             with tqdm(total=total_combos, desc="Brute force progress") as pbar:
+    #                 while True:
+    #                     chunk = list(islice(combos, chunk_size))
+    #                     if not chunk:
+    #                         break
+
+    #                     # --- MODIFICATION START ---
+    #                     # Filter combos based on the number of measurements used.
+    #                     # This assumes a measurement is a placeholder if its stype is 'NONE'.
+    #                     # You may need to adjust the placeholder value.
+    #                     filtered_chunk = [
+    #                         c for c in chunk 
+    #                         if sum(1 for (_, stype, _, _) in c if stype != 'NONE') < best_num_measurements_used
+    #                     ]
+
+    #                     # If the entire chunk is filtered out, just update the progress and continue.
+    #                     if not filtered_chunk:
+    #                         pbar.update(len(chunk))
+    #                         continue
+    #                     # --- MODIFICATION END ---
+                        
+    #                     # Submit work and get results immediately (blocking)
+    #                     # This prevents accumulation of zombie processes
+    #                     try:
+    #                         result = pool.apply_async(
+    #                             evaluate_combo_chunk_worker,
+    #                             (chunk, xt, Pt, class_args)
+    #                         )
+                            
+    #                         # Get result with timeout to prevent hanging
+    #                         chunk_results = result.get(timeout=300)  # 5 minute timeout
+                            
+    #                         for metric, traj, combo, xt_bf, Pt_bf, log_det, num_measurements_used in chunk_results:
+    #                             # Ensuring we minimize sensor usage while also mantaining certain level of accurcay
+    #                             if metric is not None and max(log_det) < R_threshold and num_measurements_used < best_num_measurements_used:
+    #                                 best_metric = metric
+    #                                 best_trajectory = traj
+    #                                 best_sensors = combo
+    #                                 best_state = xt_bf
+    #                                 best_cov = Pt_bf
+    #                                 best_log_det = log_det
+    #                                 best_num_measurements_used = num_measurements_used
+                            
+    #                         processed += len(chunk)
+    #                         pbar.update(len(chunk))
+                            
+    #                         # Force garbage collection after each chunk
+    #                         import gc
+    #                         gc.collect()
+                            
+    #                     except mp.TimeoutError:
+    #                         print(f"\nChunk timed out, skipping...")
+    #                         continue
+    #                     except Exception as e:
+    #                         print(f"\nError processing chunk: {e}")
+    #                         continue
+                
+    #             print(f"\nProcessed {processed} combinations total")
+                
+    #         # Explicitly wait for all processes to terminate
+    #         print("Waiting for all processes to terminate...")
+            
+    #     except KeyboardInterrupt:
+    #         print("\nInterrupted by user, cleaning up...")
+    #         return None
+    #     except Exception as e:
+    #         print(f"Error in multiprocessing: {e}")
+    #         return None
+    #     finally:
+    #         # Additional cleanup
+    #         import gc
+    #         gc.collect()
+        
+    #     print("Brute force search complete.")
+    #     return {
+    #         'selected_sensors': best_sensors,
+    #         'final_state': best_state,
+    #         'final_covariance': best_cov,
+    #         'trajectory': best_trajectory,
+    #         'accuracy_metric': best_metric,
+    #         'log_determinants': best_log_det,
+    #         'num_measurements_used': best_num_measurements_used,
+    #     }
+    
+    def run_brute_force_kalman_filter_no_sampling(self, start_idx=0, end_idx=None, R_threshold=None, initial_pt=None, initial_state=None, max_combos_in_memory=500):
         """
-        Zombie-resistant brute force implementation.
+        Brute force implementation that processes all sensor measurements without sampling frequency constraints.
+        Each sensor measurement becomes a separate choice in the combination space.
         """
         from itertools import product, islice
-        
+
+        if R_threshold is None:
+            raise ValueError("R_threshold must be specified for brute force KF.")
+        if start_idx is None or start_idx < 0:
+            start_idx = 0
+            print("Overriding start_idx to 0.")
+        if end_idx is None or end_idx > len(self.indexed_sensor_data):
+            end_idx = len(self.indexed_sensor_data)
+            print("Overriding end_idx to the length of indexed_sensor_data.")
+        if R_threshold is None:
+            R_threshold = -inf
+            print("Overriding R_threshold to - infinity (i.e. max information utilization).")
+
         # Set up signal handling to prevent zombies
         def signal_handler(signum, frame):
             print(f"\nReceived signal {signum}, cleaning up...")
@@ -1126,57 +1339,69 @@ class KF_SensorFusion:
             'calculate_kalman_gain': self.calculate_kalman_gain,
             'calculate_accuracy_metrics': self.calculate_accuracy_metrics,
         }
+        sensor_measurements = []
 
         # Initialize state and covariance
         xt = np.zeros(15)
-        Pt = np.diag([1000]*3 + [100]*3 + [100]*3 + [100]*3 + [1000]*3)
+        if initial_pt is not None and initial_state is not None:
+            Pt = initial_pt
+            xt[0:6] = initial_state[1:7]  # Set initial position and orientation
+            prev_time = initial_state[0]
+            start_idx_offset = start_idx 
 
-        if end_idx is None:
-            end_idx = len(self.indexed_sensor_data)
-
-        # Find first GPS measurement to initialize
-        gps_started = False
-        previous_time = None
-        sensor_data_queues = []
-        sensor_data_queue = []
-        
-        for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data[start_idx:end_idx]):
-            if not gps_started and sensor_type == 'GPS':
-                xt[0] = sensor_data['easting']
-                xt[1] = sensor_data['northing']  
-                xt[2] = sensor_data['altitude']
-                gps_started = True
-                previous_time = time
-            if not gps_started:
-                continue
-                
-            processing_frequency = overwrite_sampling_freq if (overwrite_sampling_freq is not None) else self.processing_frequency
+            for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data[start_idx:end_idx]):
+                sensor_measurements.append((index, sensor_type, time, sensor_data))
+        else:
+            Pt = np.array([
+                [10000, 0, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
+                [0, 10000, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
+                [0, 0, 10000,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
+                [0, 0, 0,        1000, 0, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],
+                [0, 0, 0,        0, 1000, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],
+                [0, 0, 0,        0, 0, 1000,     0, 0, 0,    0, 0, 0,    0, 0, 0],
+                [0, 0, 0,        0, 0, 0,     1000, 0, 0,    0, 0, 0,    0, 0, 0],
+                [0, 0, 0,        0, 0, 0,     0, 1000, 0,    0, 0, 0,    0, 0, 0],
+                [0, 0, 0,        0, 0, 0,     0, 0, 1000,    0, 0, 0,    0, 0, 0],
+                [0, 0, 0,        0, 0, 0,     0, 0, 0,    1000, 0, 0,    0, 0, 0],
+                [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 1000, 0,    0, 0, 0],
+                [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 1000,    0, 0, 0],
+                [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      10000, 0, 0],
+                [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 10000, 0],
+                [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 0, 10000],
+            ])
             
-            # Collect measurements within each time window
-            if time - previous_time < 1/processing_frequency:
-                sensor_data_queue.append((index, sensor_type, time, sensor_data))
-                continue
-                
-            if len(sensor_data_queue) == 0:
-                sensor_data_queue.append((index, sensor_type, time, sensor_data))
-                
-            sensor_data_queues.append(sensor_data_queue.copy())
-            sensor_data_queue = []
-            previous_time = time
 
-        # Step 2: Brute force all possible combinations (one sensor per queue)
-        queue_lengths = [len(q) for q in sensor_data_queues]
-        if any(l == 0 for l in queue_lengths):
-            print("Warning: At least one queue is empty, no combinations possible.")
-            return None
+            if end_idx is None:
+                end_idx = len(self.indexed_sensor_data)
 
-        total_combos = 1
-        for l in queue_lengths:
-            total_combos *= l
-        print(f"Total combinations: {total_combos}")
+            # Find first GPS measurement to initialize
+            gps_started = False
             
+            for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data[start_idx:end_idx]):
+                if not gps_started and sensor_type == 'GPS':
+                    xt[0] = sensor_data['easting']
+                    xt[1] = sensor_data['northing']  
+                    xt[2] = sensor_data['altitude']
+                    gps_started = True
+                    prev_time = time
+                if not gps_started:
+                    continue
+                    
+                # Add each sensor measurement as a potential choice
+                sensor_measurements.append((index, sensor_type, time, sensor_data))
+
+            if len(sensor_measurements) == 0:
+                print("No sensor measurements found after GPS initialization.")
+                return None
+
+        last_time = sensor_measurements[-1][2]
+
+        n_measurements = len(sensor_measurements)
+        total_combos = 2 ** n_measurements
+        print(f"Total combinations: {total_combos} (2^{n_measurements})")
+
         # Conservative settings to prevent zombie accumulation
-        num_workers = 50  # Very conservative
+        num_workers = 50
         chunk_size = max(50, max_combos_in_memory // num_workers - 1)
         
         print(f"Using {num_workers} workers with chunk size {chunk_size}")
@@ -1186,181 +1411,8 @@ class KF_SensorFusion:
         best_sensors = None
         best_state = None
         best_cov = None
-        
-        def combo_generator():
-            return product(*sensor_data_queues)
-        
-        # Use regular multiprocessing.Pool instead of ProcessPoolExecutor
-        # This gives us better control over process lifecycle
-        combos = combo_generator()
-        processed = 0
-        
-        try:
-            print("Starting multiprocessing pool...")
-            with Pool(processes=num_workers) as pool:
-                with tqdm(total=total_combos, desc="Brute force progress") as pbar:
-                    while True:
-                        chunk = list(islice(combos, chunk_size))
-                        if not chunk:
-                            break
-                        
-                        # Submit work and get results immediately (blocking)
-                        # This prevents accumulation of zombie processes
-                        try:
-                            result = pool.apply_async(
-                                evaluate_combo_chunk_worker,
-                                (chunk, xt, Pt, class_args)
-                            )
-                            
-                            # Get result with timeout to prevent hanging
-                            chunk_results = result.get(timeout=300)  # 5 minute timeout
-                            
-                            for metric, traj, combo, xt_bf, Pt_bf in chunk_results:
-                                if metric is not None and metric < best_metric:
-                                    best_metric = metric
-                                    best_trajectory = traj
-                                    best_sensors = combo
-                                    best_state = xt_bf
-                                    best_cov = Pt_bf
-                            
-                            processed += len(chunk)
-                            pbar.update(len(chunk))
-                            
-                            # Force garbage collection after each chunk
-                            import gc
-                            gc.collect()
-                            
-                        except mp.TimeoutError:
-                            print(f"\nChunk timed out, skipping...")
-                            continue
-                        except Exception as e:
-                            print(f"\nError processing chunk: {e}")
-                            continue
-                
-                print(f"\nProcessed {processed} combinations total")
-                
-            # Explicitly wait for all processes to terminate
-            print("Waiting for all processes to terminate...")
-            
-        except KeyboardInterrupt:
-            print("\nInterrupted by user, cleaning up...")
-            return None
-        except Exception as e:
-            print(f"Error in multiprocessing: {e}")
-            return None
-        finally:
-            # Additional cleanup
-            import gc
-            gc.collect()
-        
-        print("Brute force search complete.")
-        return {
-            'selected_sensors': best_sensors,
-            'final_state': best_state,
-            'final_covariance': best_cov,
-            'trajectory': best_trajectory,
-            'accuracy_metric': best_metric
-        }
-    
-    def run_brute_force_kalman_filter_no_sampling(self, start_idx=0, end_idx=None, max_combos_in_memory=500):
-        """
-        Brute force implementation that processes all sensor measurements without sampling frequency constraints.
-        Each sensor measurement becomes a separate choice in the combination space.
-        """
-        from itertools import product, islice
-        
-        # Set up signal handling to prevent zombies
-        def signal_handler(signum, frame):
-            print(f"\nReceived signal {signum}, cleaning up...")
-            sys.exit(1)
-        
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-        
-        class_args = {
-            'get_state_transition_matrix': self.get_state_transition_matrix,
-            'get_process_noise_covariance_matrix': self.get_process_noise_covariance_matrix,
-            'predict_covariance': self.predict_covariance,
-            'get_gps_observation_matrix': self.get_gps_observation_matrix,
-            'get_gps_measurement_noise_covariance_matrix': self.get_gps_measurement_noise_covariance_matrix,
-            'get_imu_observation_matrix': self.get_imu_observation_matrix,
-            'get_imu_measurement_noise_covariance_matrix': self.get_imu_measurement_noise_covariance_matrix,
-            'calculate_kalman_gain': self.calculate_kalman_gain,
-            'calculate_accuracy_metrics': self.calculate_accuracy_metrics,
-        }
-
-        # Initialize state and covariance
-        xt = np.zeros(15)
-        Pt = np.array([
-            [10000, 0, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
-            [0, 10000, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
-            [0, 0, 10000,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
-            [0, 0, 0,        1000, 0, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],
-            [0, 0, 0,        0, 1000, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],
-            [0, 0, 0,        0, 0, 1000,     0, 0, 0,    0, 0, 0,    0, 0, 0],
-            [0, 0, 0,        0, 0, 0,     1000, 0, 0,    0, 0, 0,    0, 0, 0],
-            [0, 0, 0,        0, 0, 0,     0, 1000, 0,    0, 0, 0,    0, 0, 0],
-            [0, 0, 0,        0, 0, 0,     0, 0, 1000,    0, 0, 0,    0, 0, 0],
-            [0, 0, 0,        0, 0, 0,     0, 0, 0,    1000, 0, 0,    0, 0, 0],
-            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 1000, 0,    0, 0, 0],
-            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 1000,    0, 0, 0],
-            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      10000, 0, 0],
-            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 10000, 0],
-            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 0, 10000],
-        ])
-
-        if end_idx is None:
-            end_idx = len(self.indexed_sensor_data)
-
-        # Find first GPS measurement to initialize
-        gps_started = False
-        sensor_measurements = []
-        
-        for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data[start_idx:end_idx]):
-            if not gps_started and sensor_type == 'GPS':
-                xt[0] = sensor_data['easting']
-                xt[1] = sensor_data['northing']  
-                xt[2] = sensor_data['altitude']
-                gps_started = True
-            if not gps_started:
-                continue
-                
-            # Add each sensor measurement as a potential choice
-            sensor_measurements.append((index, sensor_type, time, sensor_data))
-
-        if len(sensor_measurements) == 0:
-            print("No sensor measurements found after GPS initialization.")
-            return None
-
-        # Create groups of measurements that could be processed together
-        # For simplicity, we'll create binary choices: include or exclude each measurement
-        # This creates 2^n combinations where n is the number of measurements
-        n_measurements = len(sensor_measurements)
-        
-        # Limit the number of measurements to prevent exponential explosion
-        # if n_measurements > 20:  # 2^20 = ~1 million combinations
-        #     print(f"Too many measurements ({n_measurements}). Limiting to first 20 to prevent exponential explosion.")
-        #     sensor_measurements = sensor_measurements[:20]
-        #     n_measurements = 20
-
-        total_combos = 2 ** n_measurements
-        print(f"Total combinations: {total_combos} (2^{n_measurements})")
-        
-        # if total_combos > 1000000:  # 1 million combinations limit
-        #     print("Too many combinations. Consider reducing the measurement count or using sampling.")
-        #     return None
-            
-        # Conservative settings to prevent zombie accumulation
-        num_workers = 50
-        chunk_size = max(50, max_combos_in_memory // num_workers - 5)
-        
-        print(f"Using {num_workers} workers with chunk size {chunk_size}")
-        
-        best_metric = float('inf')
-        best_trajectory = None
-        best_sensors = None
-        best_state = None
-        best_cov = None
+        best_log_det = None
+        best_num_measurements_used = float('inf')
         
         def combo_generator():
             """Generate all possible combinations of including/excluding each measurement."""
@@ -1384,25 +1436,38 @@ class KF_SensorFusion:
                         chunk = list(islice(combos, chunk_size))
                         if not chunk:
                             break
+
+                        # Simplified filter
+                        filtered_chunk = [c for c in chunk if len(c) < best_num_measurements_used]
+
+                        # If the entire chunk is filtered out, just update the progress and continue.
+                        if not filtered_chunk:
+                            pbar.update(len(chunk))
+                            continue
+                        # --- MODIFICATION END ---
                         
                         try:
                             result = pool.apply_async(
                                 evaluate_combo_chunk_worker,
-                                (chunk, xt, Pt, class_args)
+                                (filtered_chunk, xt, Pt, class_args, prev_time, last_time)
                             )
                             
                             # Get result with timeout to prevent hanging
                             chunk_results = result.get(timeout=300)  # 5 minute timeout
                             
-                            for metric, traj, combo, xt_bf, Pt_bf in chunk_results:
-                                if metric is not None and metric < best_metric:
+                            for metric, traj, combo, xt_bf, Pt_bf, log_det, num_measurements_used in chunk_results:
+                                # Ensuring we minimize sensor usage while also mantaining certain level of accurcay
+                                if metric is not None and max(log_det) < R_threshold and num_measurements_used < best_num_measurements_used:
                                     best_metric = metric
                                     best_trajectory = traj
                                     best_sensors = combo
                                     best_state = xt_bf
                                     best_cov = Pt_bf
+                                    best_log_det = log_det
+                                    best_num_measurements_used = num_measurements_used
+                                    print("Updated Best Number of Measurements Used:", best_num_measurements_used)
                             
-                            processed += len(chunk)
+                            # processed += len(chunk)
                             pbar.update(len(chunk))
                             
                             # Force garbage collection after each chunk
@@ -1415,8 +1480,6 @@ class KF_SensorFusion:
                         except Exception as e:
                             print(f"\nError processing chunk: {e}")
                             continue
-                
-                print(f"\nProcessed {processed} combinations total")
                 
             print("Waiting for all processes to terminate...")
             
@@ -1437,7 +1500,9 @@ class KF_SensorFusion:
             'final_state': best_state,
             'final_covariance': best_cov,
             'trajectory': best_trajectory,
-            'accuracy_metric': best_metric
+            'accuracy_metric': best_metric,
+            'log_determinants': best_log_det,
+            'num_measurements_used': best_num_measurements_used,
         }
     
     def run_dead_reckoning_for_IMU(self):
@@ -2087,13 +2152,13 @@ if __name__ == "__main__":
 
     start_idx = find_start_idx_for_time_offset(sensor_fusion, 133.0)
     converging_buffer = 2000
-    start_offset = 100
+    start_offset = 40
     sampling_frq = 20
     r_value = -25
 
     ################# MAX INFORMATION UTILIZATION FOR TIME SEGMENT [start_idx, start_idx + start_offset] #################
 
-    sf_KF_state_offset, sf_KF_log_det_offset, pt_offset = sensor_fusion.run_kalman_filter_full(end_idx=start_idx) # Run full to get covariance convergence
+    sf_KF_state_offset, _, pt_offset = sensor_fusion.run_kalman_filter_full(end_idx=start_idx) # Run full to get covariance convergence
     sf_KF_state, sf_KF_log_det, sf_KF_pt = sensor_fusion.run_kalman_filter_full(start_idx=start_idx, end_idx=start_idx + start_offset, initial_pt=pt_offset, initial_state=sf_KF_state_offset[-1], print_output=True)
     
     plot_log_determinant(sf_KF_state, sf_KF_log_det, save_path="Full_KF_log_determinant_evolution.png")
@@ -2118,16 +2183,16 @@ if __name__ == "__main__":
     ################# ADAPTIVE INFORMATION UTILIZATION #################
     # r_value initialized above
 
-    sf_KF_state_offset, sf_KF_log_det_offset, pt_offset = sensor_fusion.run_adaptive_threshold_kalman_filter(end_idx=start_idx, R_threshold=r_value)
-    sf_KF_state, sf_KF_log_det, sf_KF_pt = sensor_fusion.run_adaptive_threshold_kalman_filter(start_idx=start_idx, end_idx=start_idx + start_offset, R_threshold=r_value, initial_pt=pt_offset, initial_state=sf_KF_state_offset[-1], print_output=True)
-    plot_log_determinant(sf_KF_state, sf_KF_log_det, save_path="Adaptive_KF_log_determinant_evolution.png")
+    # sf_KF_state_offset, _, pt_offset = sensor_fusion.run_adaptive_threshold_kalman_filter(end_idx=start_idx, R_threshold=r_value)
+    # sf_KF_state, sf_KF_log_det, sf_KF_pt = sensor_fusion.run_adaptive_threshold_kalman_filter(start_idx=start_idx, end_idx=start_idx + start_offset, R_threshold=r_value, initial_pt=pt_offset, initial_state=sf_KF_state_offset[-1], print_output=True)
+    # plot_log_determinant(sf_KF_state, sf_KF_log_det, save_path="Adaptive_KF_log_determinant_evolution.png")
 
 
     ################# BRUTE FORCE INFORMATION SCHEDULING UTILIZATION #################
-    # sensor_fusion.set_processing_frequency(sampling_frq)
-    # num_solutions = 50
-    # sf_KF_state_offset, _, pt_offset = sensor_fusion.run_kalman_filter_brute_force(end_idx=start_idx, num_solutions=num_solutions)
+    sensor_fusion.set_processing_frequency(sampling_frq)
+    result = sensor_fusion.run_brute_force_kalman_filter_no_sampling(start_idx=start_idx, end_idx=start_idx + start_offset, initial_pt=pt_offset, initial_state=sf_KF_state_offset[-1], R_threshold=r_value)
 
+    plot_log_determinant(result['trajectory'], result['log_determinant'], save_path="Brute_Force_KF_log_determinant_evolution.png")
     # Plotting
     # plot_kf_centered_comparison(sensor_fusion.get_utm_data(), best_set, sensor_fusion.get_GT())
     # plot_brute_force_centered_comparison(sensor_fusion.get_utm_data(), best_set, sensor_fusion.get_GT())
