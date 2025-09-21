@@ -16,7 +16,8 @@ import sys
 from scipy.interpolate import interp1d
 import math
 import decimal
-
+from numba import jit, prange
+from itertools import combinations, islice
 
 def evaluate_combo_chunk_worker(chunk, xt, Pt, class_args, prev_time, last_time):
     """Worker function with better error handling and memory management."""
@@ -75,20 +76,9 @@ def evaluate_combo_chunk_worker(chunk, xt, Pt, class_args, prev_time, last_time)
                     traj.append((last_time, *xt_bf[:6]))
                     sign_log_det, value_log_det = np.linalg.slogdet(Pt_bf)
                     log_det.append(sign_log_det * value_log_det)
-
-                # Calculate metric for this combination
-                # try:
-                #     metric_result = class_args['calculate_accuracy_metrics'](traj)
-                #     if metric_result and 'total_position_rmse' in metric_result:
-                #         metric = metric_result['total_position_rmse']
-                #     else:
-                #         metric = float('inf')  # Invalid result
-                # except Exception as metric_error:
-                #     print(f"Error calculating metrics: {metric_error}")
-                metric = float('inf')
                 
                 # Only keep essential data to reduce memory usage
-                results.append((metric, traj, combo, xt_bf.copy(), None, log_det, len(combo)))  # Don't return covariance to save memory
+                results.append((0, traj, combo, xt_bf.copy(), None, log_det, len(combo)))  # Don't return covariance to save memory
                 
             except Exception as combo_error:
                 print(f"Error processing combination: {combo_error}")
@@ -679,7 +669,7 @@ class KF_SensorFusion:
 
         # --- Main Loop Step ---
         # Loop through all data points *after* the initializing GPS point
-        for (index, sensor_type, time, sensor_data) in self.indexed_sensor_data[start_idx_offset + 1:end_idx]:
+        for (index, sensor_type, time, sensor_data) in self.indexed_sensor_data[start_idx_offset:end_idx]:
             dt = time - prev_time
             if dt < 0: # Sanity check for out-of-order data
                 prev_time = time
@@ -1011,7 +1001,7 @@ class KF_SensorFusion:
         # Start the loop *after* the initial GPS point
         if end_idx == -1:
             end_idx = len(self.indexed_sensor_data)
-        for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data[start_idx_offset + 1 : end_idx]):
+        for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data[start_idx_offset : end_idx]):
 
             # Calculate dt using the timestamp of the *selected* measurement
             dt = time - previous_time
@@ -1115,7 +1105,7 @@ class KF_SensorFusion:
             'gt_end_time': candidate_end
         }
     
-    def run_brute_force_kalman_filter_no_sampling(self, start_idx=0, end_idx=None, R_threshold=None, initial_pt=None, initial_state=None, max_combos_in_memory=500):
+    def run_brute_force_kalman_filter_no_sampling(self, start_idx=0, end_idx=None, R_threshold=None, initial_pt=None, initial_state=None, max_combos_in_memory=10000):
         """
         Brute force implementation that processes all sensor measurements without sampling frequency constraints.
         Each sensor measurement becomes a separate choice in the combination space.
@@ -1215,8 +1205,8 @@ class KF_SensorFusion:
         print(f"Total combinations: {total_combos} (2^{n_measurements})")
 
         # Conservative settings to prevent zombie accumulation
-        num_workers = 50
-        chunk_size = max(50, max_combos_in_memory // num_workers - 1)
+        num_workers = 30
+        chunk_size = max(500, max_combos_in_memory // num_workers)
         
         print(f"Using {num_workers} workers with chunk size {chunk_size}")
         
@@ -1224,7 +1214,7 @@ class KF_SensorFusion:
             print(f"\nProcessing combinations with {k} measurements...")
             
             num_combos_k = math.comb(n_measurements, k)
-            print(f"Total combinations of size {k}: {num_combos_k}")
+            # print(f"Total combinations of size {k}: {num_combos_k}")
             
             combos_k_iter = combinations(sensor_measurements, k)
             
@@ -1242,7 +1232,7 @@ class KF_SensorFusion:
                                     (chunk, xt, Pt, class_args, prev_time, last_time)
                                 )
                                 
-                                chunk_results = result.get(timeout=300)
+                                chunk_results = result.get(timeout=700)
                                 
                                 valid_results_in_chunk = []
                                 for res in chunk_results:
@@ -1256,8 +1246,7 @@ class KF_SensorFusion:
                                     
                                     metric, traj, combo, xt_bf, Pt_bf, log_det, num_used = best_in_chunk
                                     
-                                    print(f"\nFound valid combination with {k} measurements meeting R_threshold.")
-                                    print("Brute force search complete.")
+                                    print(f"\nFound valid combination with {k} measurements meeting R_threshold!!!!")
                                     return {
                                         'selected_sensors': combo,
                                         'final_state': xt_bf,
@@ -1936,7 +1925,7 @@ if __name__ == "__main__":
 
     start_idx = find_start_idx_for_time_offset(sensor_fusion, 133.0)
     converging_buffer = 2000
-    start_offset = 40
+    start_offset = 27
     sampling_frq = 20
     r_value = -25
 
@@ -1944,10 +1933,30 @@ if __name__ == "__main__":
 
     ################# MAX INFORMATION UTILIZATION FOR TIME SEGMENT [start_idx, start_idx + start_offset] #################
 
-    # sf_KF_state_offset, _, pt_offset = sensor_fusion.run_kalman_filter_full(end_idx=start_idx) # Run full to get covariance convergence
-    # sf_KF_state, sf_KF_log_det, sf_KF_pt = sensor_fusion.run_kalman_filter_full(start_idx=start_idx, end_idx=start_idx + start_offset, initial_pt=pt_offset, initial_state=sf_KF_state_offset[-1], print_output=True)
+    sf_KF_state_offset, _, pt_offset = sensor_fusion.run_kalman_filter_full(end_idx=start_idx) # Run full to get covariance convergence
+    max_sf_KF_state, max_sf_KF_log_det, max_sf_KF_pt = sensor_fusion.run_kalman_filter_full(start_idx=start_idx, end_idx=start_idx + start_offset, initial_pt=pt_offset, initial_state=sf_KF_state_offset[-1], print_output=True)
     
-    # plot_log_determinant(sf_KF_state, sf_KF_log_det, save_path="Full_KF_log_determinant_evolution.png")
+    plot_log_determinant(max_sf_KF_state, max_sf_KF_log_det, save_path="Full_KF_log_determinant_evolution.png")
+ 
+
+    ################# ADAPTIVE INFORMATION UTILIZATION #################
+
+    sf_KF_state_offset, _, pt_offset = sensor_fusion.run_adaptive_threshold_kalman_filter(end_idx=start_idx, R_threshold=r_value)
+    sf_KF_state, sf_KF_log_det, sf_KF_pt = sensor_fusion.run_adaptive_threshold_kalman_filter(start_idx=start_idx, end_idx=start_idx + start_offset, R_threshold=r_value, initial_pt=pt_offset, initial_state=sf_KF_state_offset[-1], print_output=True)
+    plot_log_determinant(sf_KF_state, sf_KF_log_det, save_path="Adaptive_KF_log_determinant_evolution.png")
+
+
+    ################# BRUTE FORCE INFORMATION SCHEDULING UTILIZATION ################# on 3
+   
+    # result = run_brute_force_kalman_filter_optimized(sensor_fusion, start_idx=start_idx, end_idx=start_idx + start_offset, initial_pt=pt_offset, initial_state=sf_KF_state_offset[-1], R_threshold=r_value, max_workers=50)
+    result = sensor_fusion.run_brute_force_kalman_filter_no_sampling(start_idx=start_idx, end_idx=start_idx + start_offset, initial_pt=pt_offset, initial_state=sf_KF_state_offset[-1], R_threshold=r_value)
+    plot_log_determinant(result['trajectory'], result['log_determinants'], save_path="Brute_Force_KF_log_determinant_evolution.png")
+
+    # Plotting
+    # plot_kf_centered_comparison(sensor_fusion.get_utm_data(), best_set, sensor_fusion.get_GT())
+    # plot_brute_force_centered_comparison(sensor_fusion.get_utm_data(), best_set, sensor_fusion.get_GT())
+
+
 
     ################# GREEDY INFORMATION SCHEDULING UTILIZATION ################# BROKEN
     # sensor_fusion.set_processing_frequency(sampling_frq)
@@ -1964,24 +1973,6 @@ if __name__ == "__main__":
     # sf_KF_state, sf_KF_log_det, sf_KF_pt = sensor_fusion.run_kalman_filter_scheduled(start_idx=start_idx, end_idx=start_idx + start_offset, initial_pt=pt_offset, initial_state=sf_KF_state_offset[-1], selection_method='random', print_output=True)
     
     # plot_log_determinant(sf_KF_state, sf_KF_log_det, save_path="Random_Scheduling_KF_log_determinant_evolution.png")
- 
-
-    ################# ADAPTIVE INFORMATION UTILIZATION #################
-
-    sf_KF_state_offset, _, pt_offset = sensor_fusion.run_adaptive_threshold_kalman_filter(end_idx=start_idx, R_threshold=r_value)
-    sf_KF_state, sf_KF_log_det, sf_KF_pt = sensor_fusion.run_adaptive_threshold_kalman_filter(start_idx=start_idx, end_idx=start_idx + start_offset, R_threshold=r_value, initial_pt=pt_offset, initial_state=sf_KF_state_offset[-1], print_output=True)
-    plot_log_determinant(sf_KF_state, sf_KF_log_det, save_path="Adaptive_KF_log_determinant_evolution.png")
-
-
-    ################# BRUTE FORCE INFORMATION SCHEDULING UTILIZATION #################
-    result = sensor_fusion.run_brute_force_kalman_filter_no_sampling(start_idx=start_idx, end_idx=start_idx + start_offset, initial_pt=pt_offset, initial_state=sf_KF_state_offset[-1], R_threshold=r_value)
-    plot_log_determinant(result['trajectory'], result['log_determinants'], save_path="Brute_Force_KF_log_determinant_evolution.png")
-
-    # Plotting
-    # plot_kf_centered_comparison(sensor_fusion.get_utm_data(), best_set, sensor_fusion.get_GT())
-    # plot_brute_force_centered_comparison(sensor_fusion.get_utm_data(), best_set, sensor_fusion.get_GT())
-
-
 
 # kill $(pgrep -f "kf_workers.py")
 # ps aux | grep -E "(zombie|<defunct>)" | grep iseanps 
