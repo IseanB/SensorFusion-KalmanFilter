@@ -19,7 +19,7 @@ import decimal
 from numba import jit, prange
 from itertools import combinations, islice
 
-def evaluate_combo_chunk_worker(chunk, xt, Pt, class_args, prev_time, last_time):
+def evaluate_combo_chunk_worker(chunk, xt, Pt, class_args, prev_time, target_end_time):
     """Worker function with better error handling and memory management."""
     results = []
     
@@ -28,8 +28,8 @@ def evaluate_combo_chunk_worker(chunk, xt, Pt, class_args, prev_time, last_time)
             try:
                 xt_bf = xt.copy()
                 Pt_bf = Pt.copy()
-                traj = []
-                log_det = []
+                traj = [(prev_time, *xt_bf[:6])]
+                log_det = [np.linalg.slogdet(Pt_bf)[0] * np.linalg.slogdet(Pt_bf)[1]]
                 # Use the passed-in prev_time for the first element of the combo
                 current_prev_time = prev_time 
                 
@@ -70,13 +70,14 @@ def evaluate_combo_chunk_worker(chunk, xt, Pt, class_args, prev_time, last_time)
                     sign_log_det, value_log_det = np.linalg.slogdet(Pt_bf)
                     log_det.append(sign_log_det * value_log_det)
                 
-                if current_prev_time < last_time - 1e-8:
-                    dt = last_time - current_prev_time
+                # FIX: Always propagate to the target end time to ensure consistency
+                if current_prev_time < target_end_time - 1e-8:
+                    dt = target_end_time - current_prev_time
                     F = class_args['get_state_transition_matrix'](dt)
                     Qt = class_args['get_process_noise_covariance_matrix'](dt)
                     xt_bf = np.dot(F, xt_bf)
                     Pt_bf = class_args['predict_covariance'](Pt_bf, F, Qt)
-                    traj.append((last_time, *xt_bf[:6]))
+                    traj.append((target_end_time, *xt_bf[:6]))
                     sign_log_det, value_log_det = np.linalg.slogdet(Pt_bf)
                     log_det.append(sign_log_det * value_log_det)
                 
@@ -94,7 +95,7 @@ def evaluate_combo_chunk_worker(chunk, xt, Pt, class_args, prev_time, last_time)
         return []  # Return empty results for this chunk
     
     return results
-    
+
 class Scheduler:
     """
     A class to represent a sensor scheduler.
@@ -1000,7 +1001,6 @@ class KF_SensorFusion:
         sign, initial_log_det = np.linalg.slogdet(Pt)
         sf_KF_log_det = [initial_log_det]
 
-        print("ADAPT STARTTINGGGGGGGGGG", start_idx_offset, ", ", end_idx)
         for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data[start_idx_offset: end_idx]):
             # Calculate dt using the timestamp of the *selected* measurement
             dt = time - previous_time
@@ -1106,7 +1106,7 @@ class KF_SensorFusion:
             'gt_start_time': candidate_start,
             'gt_end_time': candidate_end
         }
-    
+
     def run_brute_force_kalman_filter_no_sampling(self, start_idx=0, end_idx=None, R_threshold=None, initial_pt=None, initial_state=None, max_combos_in_memory=10000):
         """
         Brute force implementation that processes all sensor measurements without sampling frequency constraints.
@@ -1122,9 +1122,6 @@ class KF_SensorFusion:
         if end_idx is None or end_idx > len(self.indexed_sensor_data):
             end_idx = len(self.indexed_sensor_data)
             print("Overriding end_idx to the length of indexed_sensor_data.")
-        if R_threshold is None:
-            R_threshold = -inf
-            print("Overriding R_threshold to - infinity (i.e. max information utilization).")
 
         # Set up signal handling to prevent zombies
         def signal_handler(signum, frame):
@@ -1143,7 +1140,6 @@ class KF_SensorFusion:
             'get_imu_observation_matrix': self.get_imu_observation_matrix,
             'get_imu_measurement_noise_covariance_matrix': self.get_imu_measurement_noise_covariance_matrix,
             'calculate_kalman_gain': self.calculate_kalman_gain,
-            # 'calculate_accuracy_metrics': self.calculate_accuracy_metrics,
         }
         sensor_measurements = []
 
@@ -1200,12 +1196,17 @@ class KF_SensorFusion:
                 print("No sensor measurements found after GPS initialization.")
                 return None
 
-        last_time = sensor_measurements[-1][2]
-        # print("Given Last Time", last_time)
+        # FIX: Use the time of the last measurement in the specified range
+        # This ensures all methods end at the same time
+        last_measurement_time = self.indexed_sensor_data[end_idx - 1][2]  # time of last measurement in range
+        
+        # Also pass the target end time to the worker
+        class_args['target_end_time'] = last_measurement_time
 
         n_measurements = len(sensor_measurements)
         total_combos = 2 ** n_measurements
         print(f"Total combinations: {total_combos} (2^{n_measurements})")
+        print(f"Target end time: {last_measurement_time}")
 
         # Conservative settings to prevent zombie accumulation
         num_workers = 30
@@ -1217,7 +1218,6 @@ class KF_SensorFusion:
             print(f"\nProcessing combinations with {k} measurements...")
             
             num_combos_k = math.comb(n_measurements, k)
-            # print(f"Total combinations of size {k}: {num_combos_k}")
             
             combos_k_iter = combinations(sensor_measurements, k)
             
@@ -1232,7 +1232,7 @@ class KF_SensorFusion:
                             try:
                                 result = pool.apply_async(
                                     evaluate_combo_chunk_worker,
-                                    (chunk, xt, Pt, class_args, prev_time, last_time)
+                                    (chunk, xt, Pt, class_args, prev_time, last_measurement_time)  # Use consistent end time
                                 )
                                 
                                 chunk_results = result.get(timeout=700)
@@ -1280,7 +1280,7 @@ class KF_SensorFusion:
 
         print("\nBrute force search complete. No combination met the R_threshold.")
         return None
-    
+
     def run_dead_reckoning_for_IMU(self):
         """Run dead reckoning to generate IMU estimates."""
         # Initial state and covariance
@@ -1892,9 +1892,6 @@ def find_start_idx_for_time_offset(sensor_fusion, target_seconds):
     print(f"Target time {target_seconds}s not found in data")
     return None
 
-import matplotlib.pyplot as plt
-import numpy as np
-
 def plot_all_log_determinants(max_sf_KF_state, max_sf_KF_log_det, adapt_sf_KF_state, adapt_sf_KF_log_det, bf_result, r_value):
     """
     Plots the log determinant of the covariance matrix over time for three
@@ -1919,23 +1916,20 @@ def plot_all_log_determinants(max_sf_KF_state, max_sf_KF_log_det, adapt_sf_KF_st
         print("Brute Force KF data is incomplete. Cannot plot.")
         return
 
-    # Extract timestamps and log determinants for each method
-    max_times = np.array([state[0] for state in max_sf_KF_state])
-    max_relative_times = max_times - max_times[0]
-    
-    adapt_times = np.array([state[0] for state in adapt_sf_KF_state])
-    adapt_relative_times = adapt_times - adapt_times[0]
-    
-    bf_times = np.array([state[0] for state in bf_result['trajectory']])
-    bf_relative_times = bf_times - bf_times[0]
+    # Extract the original timestamps for each method
+    offset = 1697739552.3362827
+    max_times = np.array([state[0] for state in max_sf_KF_state]) - offset
+    adapt_times = np.array([state[0] for state in adapt_sf_KF_state]) - offset
+    bf_times = np.array([state[0] for state in bf_result['trajectory']]) - offset
+
     
     # Create the plot
     plt.figure(figsize=(14, 8))
     
-    # Plot each line
-    plt.plot(max_relative_times, max_sf_KF_log_det, color='blue', linewidth=2, label='Full KF (Max Information)')
-    plt.plot(adapt_relative_times, adapt_sf_KF_log_det, color='green', linewidth=2, linestyle='--', label='Adaptive KF')
-    plt.plot(bf_relative_times, bf_result['log_determinants'], color='purple', linewidth=2, linestyle='-', label='Brute Force KF')
+    # Plot each line using the original timestamps
+    plt.plot(max_times, max_sf_KF_log_det, color='blue', linewidth=2, label='Full KF (Max Information)')
+    plt.plot(adapt_times, adapt_sf_KF_log_det, color='green', linewidth=2, linestyle='--', label='Adaptive KF')
+    plt.plot(bf_times, bf_result['log_determinants'], color='purple', linewidth=2, linestyle='-', label='Brute Force KF')
     
     # Add the R-threshold line
     plt.axhline(y=r_value, color='red', linestyle='-.', label=f'R-threshold ({r_value})')
@@ -1945,6 +1939,12 @@ def plot_all_log_determinants(max_sf_KF_state, max_sf_KF_log_det, adapt_sf_KF_st
     plt.title('Evolution of Covariance Uncertainty for Different KF Methods')
     plt.legend()
     plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+    
+    # --- NEW SECTION ---
+    # Set the x-axis limit to the actual data range
+    start_time = min(max_times[0], adapt_times[0], bf_times[0])
+    end_time = max(max_times[-1], adapt_times[-1], bf_times[-1])
+    plt.xlim(start_time, end_time)
     
     # Set the y-axis limit for better visualization
     min_log_det = min(np.min(max_sf_KF_log_det), np.min(adapt_sf_KF_log_det), np.min(bf_result['log_determinants']))
@@ -1956,7 +1956,6 @@ def plot_all_log_determinants(max_sf_KF_state, max_sf_KF_log_det, adapt_sf_KF_st
     plt.savefig('all_kf_log_determinants_comparison.png', dpi=300)
     print("Combined log determinant plot saved to all_kf_log_determinants_comparison.png")
     
-# Usage:
 
 # main code
 if __name__ == "__main__":
@@ -1991,14 +1990,11 @@ if __name__ == "__main__":
     ################# SETUP #################
 
     # start_idx = find_start_idx_for_time_offset(sensor_fusion, 133.0)
-    # converging_buffer = 2000
     # start_offset = 18
-    # sampling_frq = 20
     # r_value = -28
 
 
-    start_idx = find_start_idx_for_time_offset(sensor_fusion, 136.0)
-    converging_buffer = 2000
+    start_idx = find_start_idx_for_time_offset(sensor_fusion, 200.0)
     start_offset = 18
     r_value = -23
     last_time = None
@@ -2008,7 +2004,6 @@ if __name__ == "__main__":
 
     sf_KF_state_offset, _, pt_offset, _ = sensor_fusion.run_kalman_filter_full(end_idx=start_idx) # Run full to get covariance convergence
     max_sf_KF_state, max_sf_KF_log_det, max_sf_KF_pt, last_time = sensor_fusion.run_kalman_filter_full(start_idx=start_idx, end_idx=start_idx + start_offset, initial_pt=pt_offset, initial_state=sf_KF_state_offset[-1], print_output=True)
-    # print("Last time from max info KF:", last_time)
     plot_log_determinant(max_sf_KF_state, max_sf_KF_log_det, save_path="Full_KF_log_determinant_evolution.png")
  
 
@@ -2016,9 +2011,6 @@ if __name__ == "__main__":
 
     sf_KF_state_offset, _, pt_offset, _ = sensor_fusion.run_adaptive_threshold_kalman_filter(end_idx=start_idx, R_threshold=r_value)
     adapt_sf_KF_state, adapt_sf_KF_log_det, adapt_sf_KF_pt, last_time = sensor_fusion.run_adaptive_threshold_kalman_filter(start_idx=start_idx, end_idx=start_idx + start_offset, R_threshold=r_value, initial_pt=pt_offset, initial_state=sf_KF_state_offset[-1], print_output=True)
-    # print("Last time from adapt info KF:", last_time)
-    print(adapt_sf_KF_state)
-    print(adapt_sf_KF_log_det)
     plot_log_determinant(adapt_sf_KF_state, adapt_sf_KF_log_det, save_path="Adaptive_KF_log_determinant_evolution.png")
 
 
@@ -2027,16 +2019,17 @@ if __name__ == "__main__":
 
     bf_result = sensor_fusion.run_brute_force_kalman_filter_no_sampling(start_idx=start_idx, end_idx=start_idx + start_offset, initial_pt=pt_offset, initial_state=sf_KF_state_offset[-1], R_threshold=r_value)
     plot_log_determinant(bf_result['trajectory'], bf_result['log_determinants'], save_path="Brute_Force_KF_log_determinant_evolution.png")
-    
-    print("Len of  MAX SF KF log det:", len(max_sf_KF_log_det))
-    print("Len of ADAPT SF KF log det:", len(adapt_sf_KF_log_det))
-    print("Len of BF SF KF log det:", len(bf_result['log_determinants']))
-
     plot_all_log_determinants(max_sf_KF_state, max_sf_KF_log_det, adapt_sf_KF_state, adapt_sf_KF_log_det, bf_result, r_value)
 
-    # Plotting
-    # plot_kf_centered_comparison(sensor_fusion.get_utm_data(), best_set, sensor_fusion.get_GT())
-    # plot_brute_force_centered_comparison(sensor_fusion.get_utm_data(), best_set, sensor_fusion.get_GT())
+    ## Accurcacy Printing Out using sensor_fusion.calculate_accuracy_metrics
+    print("Accuracy of Different KF Methods (RMSE in meters):")
+    print("Full KF (Max Information):", sensor_fusion.calculate_accuracy_metrics(max_sf_KF_state)['total_position_rmse'])
+    print("Adaptive KF:", sensor_fusion.calculate_accuracy_metrics(adapt_sf_KF_state)['total_position_rmse'])
+    print("Brute Force KF:", sensor_fusion.calculate_accuracy_metrics(bf_result['trajectory'])['total_position_rmse'])
+
+    # Plotting (Need Updating)
+    # plot_kf_centered_comparison(sensor_fusion.get_utm_data(), bf_result, sensor_fusion.get_GT())
+    # plot_brute_force_centered_comparison(sensor_fusion.get_utm_data(), bf_result, sensor_fusion.get_GT())
 
 
 
