@@ -613,7 +613,7 @@ class KF_SensorFusion:
         K_next = np.dot(np.dot(P_next, H.T), np.linalg.inv(intermediate_matrix))
         return K_next
     
-    def run_kalman_filter_full(self):
+    def run_kalman_filter_full(self, start_idx=None, end_idx=None, initial_pt=None, initial_state=None):
         """
         Run the Kalman Filter over all available sensor data and store the resulting state
         trajectory, covariance matrices, and log determinant of covariance as ground truth.
@@ -624,40 +624,53 @@ class KF_SensorFusion:
             return [], [], []
 
         # --- Initialization Step ---
-        xt = np.zeros(15)
-        Pt = np.diag([10000]*3 + [1000]*3 + [1000]*3 + [1000]*3 + [10000]*3)
-        I = np.eye(15)
+        if start_idx is None or start_idx < 0:
+            start_idx = 0
+            print("Overriding start_idx to 0.")
+        if end_idx is None or end_idx > len(self.indexed_sensor_data):
+            end_idx = len(self.indexed_sensor_data)
+            print("Overriding end_idx to the length of indexed_sensor_data.")
 
-        # Find the first GPS measurement to initialize the state robustly
-        first_gps_idx = -1
-        initial_time = None
-        for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data):
-            if sensor_type == 'GPS':
-                xt[0] = sensor_data['easting']
-                xt[1] = sensor_data['northing']
-                xt[2] = sensor_data['altitude']
-                initial_time = time
-                first_gps_idx = i
-                break
-        
-        if first_gps_idx == -1:
-            print("No GPS data found to initialize the filter.")
-            return [], [], []
+        xt = np.zeros(15)
+        I = np.eye(15)
+        if initial_pt is not None and initial_state is not None:
+            Pt = initial_pt
+            xt[0:6] = initial_state[1:7]  # Set initial position and orientation
+            prev_time = initial_state[0]
+
+            start_idx_offset = start_idx
+            print("Using provided initial covariance matrix.")
+        else:
+            Pt = np.diag([10000]*3 + [1000]*3 + [1000]*3 + [1000]*3 + [10000]*3)
+            # Find the first GPS measurement to initialize the state robustly
+            start_idx_offset = -1
+            prev_time = None
+            for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data[start_idx:]):
+                if sensor_type == 'GPS':
+                    xt[0] = sensor_data['easting']
+                    xt[1] = sensor_data['northing']
+                    xt[2] = sensor_data['altitude']
+                    prev_time = time
+                    start_idx_offset = i
+                    break
+            
+            if start_idx_offset == -1:
+                print("No GPS data found to initialize the filter.")
+                return [], [], []
 
         # Initialize all lists with the state *at* the first GPS point
-        sf_KF_state = [(initial_time, *xt[:6])]
+        sf_KF_state = [(prev_time, *xt[:6])]
         sf_KF_covariance = [Pt.copy()]
         sign, log_det = np.linalg.slogdet(Pt)
         sf_KF_log_det = [log_det]
-        
-        previous_time = initial_time
+        total_sensor_count = 0
 
         # --- Main Loop Step ---
         # Loop through all data points *after* the initializing GPS point
-        for (index, sensor_type, time, sensor_data) in tqdm(self.indexed_sensor_data[first_gps_idx + 1:], desc="Calculating Ground Truth"):
-            dt = time - previous_time
+        for (index, sensor_type, time, sensor_data) in tqdm(self.indexed_sensor_data[start_idx_offset + 1:end_idx], desc="Calculating Ground Truth"):
+            dt = time - prev_time
             if dt < 0: # Sanity check for out-of-order data
-                previous_time = time
+                prev_time = time
                 continue
 
             # Prediction Step
@@ -692,13 +705,15 @@ class KF_SensorFusion:
             sign, log_det = np.linalg.slogdet(Pt)
             sf_KF_log_det.append(log_det)
             
-            previous_time = time
+            total_sensor_count += 1
+
+            prev_time = time
 
         self._ground_truth = sf_KF_state
         self._ground_truth_cov = sf_KF_covariance
         print("Ground truth Kalman Filter trajectory stored.")
         
-        return sf_KF_state, sf_KF_covariance, sf_KF_log_det
+        return sf_KF_state, sf_KF_covariance, sf_KF_log_det, Pt
 
     def get_GT(self):
         """Return the ground truth trajectory computed by the Kalman Filter."""
@@ -796,64 +811,57 @@ class KF_SensorFusion:
             previous_time = time  # Update previous time
         return sf_KF_state, sf_KF_covariance
 
-    def run_kalman_filter_scheduled(self, start_idx, end_idx):
+    def run_kalman_filter_scheduled(self, start_idx, end_idx,inital_pt=None):
         """Run the Kalman Filter to fuse IMU and GPS data for pose estimation."""
         # Initialize state and covariance
         xt = np.zeros(15)
-        Pt = np.array([
-            [10000, 0, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
-            [0, 10000, 0,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
-            [0, 0, 10000,     0, 0, 0,       0, 0, 0,    0, 0, 0,    0, 0, 0],
-            [0, 0, 0,        1000, 0, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],
-            [0, 0, 0,        0, 1000, 0,     0, 0, 0,    0, 0, 0,    0, 0, 0],
-            [0, 0, 0,        0, 0, 1000,     0, 0, 0,    0, 0, 0,    0, 0, 0],
-            [0, 0, 0,        0, 0, 0,     1000, 0, 0,    0, 0, 0,    0, 0, 0],
-            [0, 0, 0,        0, 0, 0,     0, 1000, 0,    0, 0, 0,    0, 0, 0],
-            [0, 0, 0,        0, 0, 0,     0, 0, 1000,    0, 0, 0,    0, 0, 0],
-            [0, 0, 0,        0, 0, 0,     0, 0, 0,    1000, 0, 0,    0, 0, 0],
-            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 1000, 0,    0, 0, 0],
-            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 1000,    0, 0, 0],
-            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      10000, 0, 0],
-            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 10000, 0],
-            [0, 0, 0,        0, 0, 0,     0, 0, 0,    0, 0, 0,      0, 0, 10000],
-        ])
+        if inital_pt is not None:
+            Pt = inital_pt
+        else:
+            Pt = np.diag([10000]*3 + [1000]*3 + [1000]*3 + [1000]*3 + [10000]*3)
         I = np.eye(15)
+        total_sensor_count = 0
 
         # Find the initial GPS measurement in the subset to initialize xt and previous_time.
         gps_started = False
         previous_time = None
-        for (index, sensor_type, time, sensor_data) in self.indexed_sensor_data[start_idx:end_idx]:
+        first_gps_idx = -1
+        for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data[start_idx:end_idx]):
             if sensor_type == 'GPS':
                 xt[0] = sensor_data['easting']
                 xt[1] = sensor_data['northing']
                 xt[2] = sensor_data['altitude']
                 previous_time = time
                 gps_started = True
+                first_gps_idx = start_idx + i
                 break
+        
         if not gps_started:
             print("WARN: No GPS measurement found in the sensor subset.")
-            return None
+            return None, None
 
-        # Store initial state (using the GPS time)
-        sf_KF_state = [(previous_time, xt[0], xt[1], xt[2], xt[3], xt[4], xt[5])]
+        # Store initial state and log determinant
+        sf_KF_state = [(previous_time, *xt[:6])]
+        sign, initial_log_det = np.linalg.slogdet(Pt)
+        sf_KF_log_det = [initial_log_det]
         
         sensor_data_queue = []
-        for i, (index, sensor_type, time, sensor_data) in tqdm(enumerate(self.indexed_sensor_data[start_idx:end_idx])):
-            # Only process measurements occurring after initialization.
-            if time < previous_time:
-                continue
-
+        # Start the loop *after* the initial GPS point
+        if end_idx == -1:
+            end_idx = len(self.indexed_sensor_data)
+        for i, (index, sensor_type, time, sensor_data) in tqdm(enumerate(self.indexed_sensor_data[first_gps_idx + 1 : end_idx]), desc="Scheduled KF"):
+            
             # Collect sensor data over the sampling period.
             if time - previous_time < 1/self.processing_frequency:
                 sensor_data_queue.append((index, sensor_type, time, sensor_data))
                 continue
 
-            # Ensure there is at least one measurement for update.
-            if len(sensor_data_queue) == 0:
+            if not sensor_data_queue:
+                # If the gap was too large, process the current measurement by itself
                 sensor_data_queue.append((index, sensor_type, time, sensor_data))
             
             # Choose the best measurement using the scheduler.
-            selected_measurement_index = self.scheduler.greedy_schedule(
+            selected_measurement_global_index = self.scheduler.greedy_schedule(
                 sensor_data_queue,
                 S_sigma=Pt,
                 measurement_cov={
@@ -866,68 +874,303 @@ class KF_SensorFusion:
                 },
                 device='cpu'
             )
-            sensor_data_queue = []
-            (index, sensor_type, time, sensor_data) = self.indexed_sensor_data[selected_measurement_index]
             
-            # Calculate dt
-            dt = time - previous_time if previous_time is not None else 0
+            # Get the full data for the selected measurement
+            (selected_idx, selected_stype, selected_time, selected_sdata) = sensor_data_queue[selected_measurement_global_index]
+            sensor_data_queue = [] # Clear the queue for the next window
+            
+            # Calculate dt using the timestamp of the *selected* measurement
+            dt = selected_time - previous_time
 
-            # Prediction step for both GPS and IMU.
+            # Prediction step
             F = self.get_state_transition_matrix(dt)
             Qt = self.get_process_noise_covariance_matrix(dt)
             xt = np.dot(F, xt)
             Pt = self.predict_covariance(Pt, F, Qt)
 
-            # Update step based on sensor type.
-            if sensor_type == 'GPS':
-                H_GPS = self.get_gps_observation_matrix()
-                R_GPS = self.get_gps_measurement_noise_covariance_matrix()
-                Zt_GPS = [sensor_data['easting'], sensor_data['northing'], sensor_data['altitude']]
-                Kt = self.calculate_kalman_gain(Pt, H_GPS, R_GPS)
-                y = Zt_GPS - np.dot(H_GPS, xt)
-                xt = xt + np.dot(Kt, y)
-                Pt = np.dot(I - np.dot(Kt, H_GPS), Pt)
-            elif sensor_type == 'IMU':
-                ax = sensor_data[7]
-                ay = sensor_data[8]
-                az = sensor_data[9]
-                Vx = xt[6] + ax * dt
-                Vy = xt[7] + ay * dt
-                Vz = xt[8] + az * dt
-                X = xt[0] + Vx * dt
-                Y = xt[1] + Vy * dt
-                Z = xt[2] + Vz * dt
-                roll = sensor_data[1]
-                pitch = sensor_data[2]
-                yaw = sensor_data[3]
-                ang_x = sensor_data[4]
-                ang_y = sensor_data[5]
-                ang_z = sensor_data[6]
-                Zt_IMU = [X, Y, Z, roll, pitch, yaw, Vx, Vy, Vz, ang_x, ang_y, ang_z, ax, ay, az]
-                H_IMU = self.get_imu_observation_matrix()
-                R_IMU = self.get_imu_measurement_noise_covariance_matrix()
-                Kt = self.calculate_kalman_gain(Pt, H_IMU, R_IMU)
-                y = np.array(Zt_IMU) - np.dot(H_IMU, xt)
-                xt = xt + np.dot(Kt, y)
-                Pt = np.dot(I - np.dot(Kt, H_IMU), Pt)
+            # Update step based on the selected sensor type
+            if selected_stype == 'GPS':
+                H = self.get_gps_observation_matrix()
+                R = self.get_gps_measurement_noise_covariance_matrix()
+                Z = [selected_sdata['easting'], selected_sdata['northing'], selected_sdata['altitude']]
+            else: # IMU
+                ax, ay, az = selected_sdata[7], selected_sdata[8], selected_sdata[9]
+                Vx, Vy, Vz = xt[6] + ax * dt, xt[7] + ay * dt, xt[8] + az * dt
+                X, Y, Z_pos = xt[0] + Vx * dt, xt[1] + Vy * dt, xt[2] + Vz * dt
+                roll, pitch, yaw = selected_sdata[1], selected_sdata[2], selected_sdata[3]
+                ang_x, ang_y, ang_z = selected_sdata[4], selected_sdata[5], selected_sdata[6]
+                Z = [X, Y, Z_pos, roll, pitch, yaw, Vx, Vy, Vz, ang_x, ang_y, ang_z, ax, ay, az]
+                H = self.get_imu_observation_matrix()
+                R = self.get_imu_measurement_noise_covariance_matrix()
             
-            sf_KF_state.append((time, xt[0], xt[1], xt[2], xt[3], xt[4], xt[5]))
-            previous_time = time
+            K = self.calculate_kalman_gain(Pt, H, R)
+            y = np.array(Z) - np.dot(H, xt)
+            xt = xt + np.dot(K, y)
+            Pt = np.dot(I - np.dot(K, H), Pt)
+            
+            # Append results for this time step
+            sf_KF_state.append((selected_time, *xt[:6]))
+            sign, log_det = np.linalg.slogdet(Pt)
+            sf_KF_log_det.append(log_det)
+            
+            previous_time = selected_time
+            total_sensor_count += 1
 
-        return sf_KF_state
+        print(f"Scheduled KF processed {total_sensor_count} measurements from index {first_gps_idx + 1} to {end_idx}")
 
-    def calculate_accuracy_metrics(self, candidate_trajectory, window_size=5):
+        return sf_KF_state, sf_KF_log_det, Pt
+    
+    def run_adaptive_threshold_kalman_filter(self, start_idx, end_idx, R_threshold, inital_pt=None):
         """
-        Compare a candidate trajectory against the ground truth trajectory stored in self._ground_truth.
-        Instead of simply using the first and last state's timestamps, this version uses all measurements 
-        in the first and last 'window_size' of the candidate trajectory to determine a robust time window.
+        Run Kalman Filter with adaptive measurement processing based on covariance threshold.
+        """
+        # Initialize state and covariance
+        xt = np.zeros(15)
+        if (inital_pt is not None):
+            Pt = inital_pt
+        else:
+            Pt = np.diag([10000]*3 + [1000]*3 + [1000]*3 + [1000]*3 + [10000]*3)
+        I = np.eye(15)
+        total_sensor_count = 0
+
+        # Find the initial GPS measurement
+        gps_started = False
+        previous_time = None
+        first_gps_idx = -1
+        for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data[start_idx:end_idx]):
+            if sensor_type == 'GPS':
+                xt[0] = sensor_data['easting']
+                xt[1] = sensor_data['northing']
+                xt[2] = sensor_data['altitude']
+                previous_time = time
+                gps_started = True
+                first_gps_idx = start_idx + i
+                break
         
-        Parameters:
-            candidate_trajectory (list of tuples): Each tuple contains (time, x, y, z, roll, pitch, yaw)
-            window_size (int): Number of measurements from the start and end used to define the time window.
+        if not gps_started:
+            print("WARN: No GPS measurement found in the sensor subset.")
+            return None, None
+
+        # Store initial state and log determinant
+        sf_KF_state = [(previous_time, *xt[:6])]
+        sign, initial_log_det = np.linalg.slogdet(Pt)
+        sf_KF_log_det = [initial_log_det]
         
-        Returns:
-            dict: Dictionary containing overall RMSE, per-point errors, and other details.
+        if end_idx == -1:
+            end_idx = len(self.indexed_sensor_data)
+        
+        print(f"Starting adaptive KF from index {first_gps_idx + 1} to {end_idx}")
+        print(f"Processing frequency: {self.processing_frequency} Hz")
+        print(f"Log determinant threshold: {R_threshold}")
+        
+        # Start processing after the initial GPS point
+        current_idx = first_gps_idx + 1
+        processed_windows = 0
+        total_measurements_processed = 0
+        
+        with tqdm(total=end_idx - current_idx, desc="Adaptive KF") as pbar:
+            while current_idx < end_idx:
+                # Collect measurements for current window based on sampling frequency
+                sensor_data_queue = []
+                window_end_time = previous_time + 1.0/self.processing_frequency
+                
+                # Collect all measurements within this time window
+                temp_idx = current_idx
+                while temp_idx < end_idx:
+                    (index, sensor_type, time, sensor_data) = self.indexed_sensor_data[temp_idx]
+                    
+                    if time <= window_end_time:
+                        sensor_data_queue.append((index, sensor_type, time, sensor_data))
+                        temp_idx += 1
+                    else:
+                        break
+                
+                # If no measurements in this window, advance time and continue
+                if not sensor_data_queue:
+                    # print(f"No measurements in time window [{previous_time:.6f}, {window_end_time:.6f}]")
+                    previous_time = window_end_time  # Advance time
+                    current_idx = temp_idx  # Move index forward
+                    pbar.update(max(1, temp_idx - current_idx))
+                    continue
+                
+                processed_windows += 1
+                # print(f"\nWindow {processed_windows}: {len(sensor_data_queue)} measurements available")
+                
+                # Process measurements in chronological order until threshold is met
+                measurements_processed_in_window = 0
+                
+                for measurement_idx in range(len(sensor_data_queue)):
+                    (selected_idx, selected_stype, selected_time, selected_sdata) = sensor_data_queue[measurement_idx]
+                    
+                    # Calculate dt
+                    dt = selected_time - previous_time
+                    if dt <= 0:
+                        # print(f"Warning: Non-positive dt = {dt}, skipping measurement")
+                        continue
+
+                    # Prediction step
+                    try:
+                        F = self.get_state_transition_matrix(dt)
+                        Qt = self.get_process_noise_covariance_matrix(dt)
+                        xt = np.dot(F, xt)
+                        Pt = self.predict_covariance(Pt, F, Qt)
+
+                        # Update step based on sensor type
+                        if selected_stype == 'GPS':
+                            H = self.get_gps_observation_matrix()
+                            R = self.get_gps_measurement_noise_covariance_matrix()
+                            Z = [selected_sdata['easting'], selected_sdata['northing'], selected_sdata['altitude']]
+                        else: # IMU
+                            ax, ay, az = selected_sdata[7], selected_sdata[8], selected_sdata[9]
+                            Vx, Vy, Vz = xt[6] + ax * dt, xt[7] + ay * dt, xt[8] + az * dt
+                            X, Y, Z_pos = xt[0] + Vx * dt, xt[1] + Vy * dt, xt[2] + Vz * dt
+                            roll, pitch, yaw = selected_sdata[1], selected_sdata[2], selected_sdata[3]
+                            ang_x, ang_y, ang_z = selected_sdata[4], selected_sdata[5], selected_sdata[6]
+                            Z = [X, Y, Z_pos, roll, pitch, yaw, Vx, Vy, Vz, ang_x, ang_y, ang_z, ax, ay, az]
+                            H = self.get_imu_observation_matrix()
+                            R = self.get_imu_measurement_noise_covariance_matrix()
+                        
+                        K = self.calculate_kalman_gain(Pt, H, R)
+                        y = np.array(Z) - np.dot(H, xt)
+                        xt = xt + np.dot(K, y)
+                        Pt = np.dot(I - np.dot(K, H), Pt)
+                        
+                        # Calculate log determinant
+                        sign, current_log_det = np.linalg.slogdet(Pt)
+                        
+                        # Store results
+                        sf_KF_state.append((selected_time, *xt[:6]))
+                        sf_KF_log_det.append(current_log_det)
+                        
+                        previous_time = selected_time
+                        measurements_processed_in_window += 1
+                        total_measurements_processed += 1
+                        
+                        # Check threshold condition
+                        if current_log_det <= R_threshold: # Acceptable uncertainty
+                            # print(f"  Log det {current_log_det:.2f} >= threshold {R_threshold}, moving to next window after {measurements_processed_in_window}/{len(sensor_data_queue)} measurements")
+                            break
+                        else:
+                            total_sensor_count += 1
+                            # print(f"  Log det {current_log_det:.2f} < threshold {R_threshold}, continuing in window ({measurements_processed_in_window}/{len(sensor_data_queue)})")
+                            
+                    except Exception as e:
+                        print(f"Error in KF update: {e}, skipping measurement")
+                        continue
+                
+                # Move to next window - advance current_idx to skip processed measurements
+                # This is critical to prevent infinite loops
+                measurements_to_skip = min(measurements_processed_in_window, len(sensor_data_queue))
+                if measurements_to_skip == 0:
+                    measurements_to_skip = len(sensor_data_queue)  # Skip entire window if no measurements processed
+                    
+                current_idx += measurements_to_skip
+                pbar.update(measurements_to_skip)
+                
+                # print(f"  Advanced index by {measurements_to_skip}, now at {current_idx}/{end_idx}")
+        
+        print(f"\nCompleted: Processed {processed_windows} windows, {total_measurements_processed} total measurements")
+        print(f"Final trajectory length: {len(sf_KF_state)}")
+        print(f"Total sensor measurements processed: {total_sensor_count}")
+        
+        return sf_KF_state, sf_KF_log_det
+
+    def run_adaptive_threshold_kalman_filter_v2(self, start_idx, end_idx, R_threshold, initial_pt=None, initial_state=None):
+        """Run the Kalman Filter to fuse IMU and GPS data for pose estimation."""
+        # Initialize state and covariance
+        xt = np.zeros(15)
+        I = np.eye(15)
+        total_sensor_count = 0
+
+        if initial_pt is not None and initial_state is not None:
+            Pt = initial_pt
+            xt[0:6] = initial_state[1:7]  # Set initial position and orientation
+            previous_time = initial_state[0]
+            start_idx_offset = start_idx 
+        else:
+            Pt = np.diag([10000]*3 + [1000]*3 + [1000]*3 + [1000]*3 + [10000]*3)
+
+            # Find the initial GPS measurement in the subset to initialize xt and previous_time.
+            gps_started = False
+            previous_time = None
+            start_idx_offset = -1
+            for i, (index, sensor_type, time, sensor_data) in enumerate(self.indexed_sensor_data[start_idx:end_idx]):
+                if sensor_type == 'GPS':
+                    xt[0] = sensor_data['easting']
+                    xt[1] = sensor_data['northing']
+                    xt[2] = sensor_data['altitude']
+                    previous_time = time
+                    gps_started = True
+                    start_idx_offset = start_idx + i
+                    break
+            
+            if not gps_started:
+                print("WARN: No GPS measurement found in the sensor subset.")
+                return None, None
+
+        # Store initial state and log determinant
+        sf_KF_state = [(previous_time, *xt[:6])]
+        sign, initial_log_det = np.linalg.slogdet(Pt)
+        sf_KF_log_det = [initial_log_det]
+        
+        sensor_data_queue = []
+
+        # Start the loop *after* the initial GPS point
+        if end_idx == -1:
+            end_idx = len(self.indexed_sensor_data)
+        for i, (index, sensor_type, time, sensor_data) in tqdm(enumerate(self.indexed_sensor_data[start_idx_offset + 1 : end_idx]), desc="Scheduled KF"):
+
+            # [xxxxx, yyy, zzzzz, ppppp, qqqqq, rrrrr, vvvvvv, wwwwww, uuuuuu, aaaaaa, bbbbbb, cccccc, dddddd, eeeeee, ffffff]
+
+            # Calculate dt using the timestamp of the *selected* measurement
+            dt = time - previous_time
+
+            # Prediction step
+            F = self.get_state_transition_matrix(dt)
+            Qt = self.get_process_noise_covariance_matrix(dt)
+            xt = np.dot(F, xt)
+            Pt = self.predict_covariance(Pt, F, Qt)
+
+            curr_log_det_sign, curr_log_det = np.linalg.slogdet(Pt)
+
+            if (curr_log_det * curr_log_det_sign > R_threshold): # If too uncertain, process point
+                # Update step based on the selected sensor type
+                if sensor_type == 'GPS':
+                    H = self.get_gps_observation_matrix()
+                    R = self.get_gps_measurement_noise_covariance_matrix()
+                    Z = [sensor_data['easting'], sensor_data['northing'], sensor_data['altitude']]
+                else: # IMU
+                    ax, ay, az = sensor_data[7], sensor_data[8], sensor_data[9]
+                    Vx, Vy, Vz = xt[6] + ax * dt, xt[7] + ay * dt, xt[8] + az * dt
+                    X, Y, Z_pos = xt[0] + Vx * dt, xt[1] + Vy * dt, xt[2] + Vz * dt
+                    roll, pitch, yaw = sensor_data[1], sensor_data[2], sensor_data[3]
+                    ang_x, ang_y, ang_z = sensor_data[4], sensor_data[5], sensor_data[6]
+                    Z = [X, Y, Z_pos, roll, pitch, yaw, Vx, Vy, Vz, ang_x, ang_y, ang_z, ax, ay, az]
+                    H = self.get_imu_observation_matrix()
+                    R = self.get_imu_measurement_noise_covariance_matrix()
+                
+                K = self.calculate_kalman_gain(Pt, H, R)
+                y = np.array(Z) - np.dot(H, xt)
+                xt = xt + np.dot(K, y)
+                Pt = np.dot(I - np.dot(K, H), Pt)
+                
+                # Append results for this time step
+                sf_KF_state.append((time, *xt[:6]))
+                sign, log_det = np.linalg.slogdet(Pt)
+                sf_KF_log_det.append(log_det)
+                
+                previous_time = time
+                total_sensor_count += 1
+
+        print(f"Scheduled KF processed {total_sensor_count} measurements out of {end_idx - start_idx_offset} in total, from index {start_idx_offset} to {end_idx}")
+
+        return sf_KF_state, sf_KF_log_det, Pt
+    
+
+    def calculate_accuracy_metrics(self, candidate_trajectory):
+        """
+        Compare a candidate trajectory against the ground truth trajectory.
+        This version assumes the candidate trajectory is sorted by time.
         """
         if not candidate_trajectory:
             print("Candidate trajectory is empty. Cannot calculate accuracy.")
@@ -937,19 +1180,16 @@ class KF_SensorFusion:
             print("Ground truth trajectory is not available. Run run_kalman_filter_full() first.")
             return None
 
-        # Determine robust time window from candidate trajectory
-        if len(candidate_trajectory) < window_size:
-            candidate_start = candidate_trajectory[0][0]
-            candidate_end = candidate_trajectory[-1][0]
-        else:
-            candidate_start = min(state[0] for state in candidate_trajectory[:window_size])
-            candidate_end = max(state[0] for state in candidate_trajectory[-window_size:])
+        # --- MODIFIED SECTION ---
+        # Directly use the first and last timestamps, assuming the trajectory is sorted.
+        candidate_start = candidate_trajectory[0][0]
+        candidate_end = candidate_trajectory[-1][0]
+        # --- END MODIFIED SECTION ---
 
-        # Extract ground truth section corresponding to the expanded time window
+        # Extract ground truth section corresponding to the time window
         gt_full = self._ground_truth
         gt_section = [state for state in gt_full if candidate_start <= state[0] <= candidate_end]
         if len(gt_section) < 2:
-            # Not enough GT points in the window; fall back to the full GT for interpolation.
             gt_times = np.array([state[0] for state in gt_full])
             gt_positions = np.array([state[1:4] for state in gt_full])
         else:
@@ -1907,13 +2147,33 @@ def plot_log_determinant(sf_KF_state, sf_KF_log_det, save_path='log_determinant_
     plt.title('Evolution of Covariance Uncertainty Over Time')
     plt.grid(True, which='both', linestyle='--', linewidth=0.5)
     plt.tight_layout()
-    plt.ylim(-40, -30)
-    plt.xlim(130, 135)
+    # plt.ylim(-30, -21)
     
     # Save the plot
     plt.savefig(save_path, dpi=300)
     print(f"Log determinant plot saved to {save_path}")
     # plt.show()
+
+def find_start_idx_for_time_offset(sensor_fusion, target_seconds):
+    """Find the index where the trajectory reaches target_seconds from start."""
+    if not hasattr(sensor_fusion, 'indexed_sensor_data') or not sensor_fusion.indexed_sensor_data:
+        print("Sensor data not available. Run combine_sensor_data() first.")
+        return None
+    
+    # Get the first timestamp as reference
+    first_timestamp = 1697739552.3362827  # (idx, sensor_type, time, data)
+    target_timestamp = first_timestamp + target_seconds
+    
+    # Search for the closest index
+    for i, (index, sensor_type, time, sensor_data) in enumerate(sensor_fusion.indexed_sensor_data):
+        if time >= target_timestamp:
+            print(f"Found index {i} at time {time:.3f}s (offset: {time - first_timestamp:.3f}s)")
+            return i
+    
+    print(f"Target time {target_seconds}s not found in data")
+    return None
+
+# Usage:
 
 # main code
 if __name__ == "__main__":
@@ -1937,36 +2197,41 @@ if __name__ == "__main__":
     sensor_fusion.unbias_imu_data(angular_velocity_bias, linear_acceleration_bias)
 
     # Compute stationary orientation of the IMU
-    avg_roll, avg_pitch, avg_yaw = sensor_fusion.compute_stationary_orientation(first_valid_index)
+    # avg_roll, avg_pitch, avg_yaw = sensor_fusion.compute_stationary_orientation(first_valid_index)
 
     # Combine GPS and IMU data and sort by timestamp
     sensor_fusion.combine_sensor_data()
 
-    # Calculate ground truth based on using all avalilable GPS data
-    print("Calculating Ground Truth...")
-    sf_KF_state, sf_KF_covariance, sf_KF_log_det = sensor_fusion.run_kalman_filter_full()
-
-    # sensor_fusion.plot_covariance_evolution(sf_KF_state, sf_KF_covariance)
-    # sensor_fusion.plot_covariance_heatmap(sf_KF_covariance)
-    # sensor_fusion.plot_uncertainty_ellipses_2d(sf_KF_state, sf_KF_covariance)
-    plot_log_determinant(sf_KF_state, sf_KF_log_det)
-    print("Ground Truth Calculation Complete!")
-
-    # Run Kalman filter for sensor fusion
-    # sf_KF_state = sensor_fusion.run_kalman_filter_scheduled() # Output (Time Steps x 6) where stored values are (X, Y, Z, roll, pitch, yaw)
-
     # deadreckoned_IMU_estimates = sensor_fusion.run_dead_reckoning_for_IMU() # Output (Time Steps x 6) where stored values are (X, Y, Z, roll, pitch, yaw)
 
-    start_idx = 103000  # i1_t=0 i2_t=0.0001 g1_t=0.0006 i3 i4 ... i100 g40
-    start_offset = 50 
+    start_idx = find_start_idx_for_time_offset(sensor_fusion, 133.0)
+    converging_buffer = 2000
+    start_offset = 100
     sampling_frq = 20
+    r_value = -24
+
+    sensor_fusion.set_processing_frequency(sampling_frq) # Set to 100 Hz for full data processing
+    sf_KF_state_offset, sf_KF_covariance_offset, sf_KF_log_det_offset, pt_offset = sensor_fusion.run_kalman_filter_full(end_idx=start_idx) # Run full to get covariance convergence
+    sf_KF_state, sf_KF_covariance, sf_KF_log_det, sf_KF_pt = sensor_fusion.run_kalman_filter_full(start_idx=start_idx, end_idx=start_idx + start_offset, initial_pt=pt_offset, initial_state=sf_KF_state_offset[-1])
+    # sf_KF_state, sf_KF_log_det, sf_KF_pt = sensor_fusion.run_adaptive_threshold_kalman_filter_v2(start_idx=start_idx, end_idx=start_idx + start_offset, R_threshold=r_value, initial_pt=pt_offset, initial_state=sf_KF_state_offset[-1]) # Output (Time Steps x 6) where stored values are (X, Y, Z, roll, pitch, yaw)
+    plot_log_determinant(sf_KF_state, sf_KF_log_det)
+
+
+    #     # __, _, sf_KF_pt = sensor_fusion.run_kalman_filter_scheduled(start_idx - 2000 , start_idx + start_offset + converging_buffer - 2000) # Converged Pt for analysis of certain time segments
+    # # sf_KF_state, sf_KF_log_det, sf_KF_pt = sensor_fusion.run_kalman_filter_scheduled(start_idx, start_idx + start_offset, sf_KF_pt) # Output (Time Steps x 6) where stored values are (X, Y, Z, roll, pitch, yaw)
+    # sf_KF_state, sf_KF_log_det, sf_KF_pt = sensor_fusion.run_adaptive_threshold_kalman_filter_v2(start_idx=start_idx, end_idx=start_idx + start_offset, R_threshold=r_value, inital_pt=offset_pt)
+    # plot_log_determinant(sf_KF_state, sf_KF_log_det)
+
+
+
+    # OKAY IF VERY SIMPLE TRAJ (SL OR MAYBE CURVE)
 
     # print("Running Brute Force KF with Sampling Frequency:", sampling_frq)
-    best_set = sensor_fusion.run_sampled_brute_force_kalman_filter(start_idx, start_idx + start_offset, sampling_frq)
+    # best_set = sensor_fusion.run_sampled_brute_force_kalman_filter(start_idx, start_idx + start_offset, sampling_frq)
     # best_set = sensor_fusion.run_brute_force_kalman_filter_no_sampling(start_idx, start_idx + start_offset)
-    print("Brute Force - Accuracy Metric (Total Position RMSE):", best_set['accuracy_metric']) # Accuracy Metric (Total Position RMSE): 1.2345
-    print("Trajectory:", (best_set['trajectory'])) # Trajectory Length: 1412
-    print("Selected Sensors:", best_set['selected_sensors']) # Selected Sensors: [('i100', 'IMU', 10.0001, {...}), ('g40', 'GPS', 10.0006, {...})]
+    # print("Brute Force - Accuracy Metric (Total Position RMSE):", best_set['accuracy_metric']) # Accuracy Metric (Total Position RMSE): 1.2345
+    # print("Trajectory:", (best_set['trajectory'])) # Trajectory Length: 1412
+    # print("Selected Sensors:", best_set['selected_sensors']) # Selected Sensors: [('i100', 'IMU', 10.0001, {...}), ('g40', 'GPS', 10.0006, {...})]
 
     # output = sensor_fusion.run_kalman_filter(start_idx, start_idx + start_offset) # ONLY USE IMU, BROKEN
     # print("Regular KF - Accuracy Metric (Total Position RMSE):", sensor_fusion.calculate_accuracy_metrics(output)) # Accuracy
@@ -1976,8 +2241,8 @@ if __name__ == "__main__":
     # print("Accuracy Metric (Total Position RMSE):", sensor_fusion.calculate_accuracy_metrics(standard_kf_trajectory)) # Accuracy
 
     # Plotting
-    plot_kf_centered_comparison(sensor_fusion.get_utm_data(), best_set, sensor_fusion.get_GT())
-    plot_brute_force_centered_comparison(sensor_fusion.get_utm_data(), best_set, sensor_fusion.get_GT())
+    # plot_kf_centered_comparison(sensor_fusion.get_utm_data(), best_set, sensor_fusion.get_GT())
+    # plot_brute_force_centered_comparison(sensor_fusion.get_utm_data(), best_set, sensor_fusion.get_GT())
 
 
 
