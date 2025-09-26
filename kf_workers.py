@@ -2126,6 +2126,127 @@ def plot_log_determinant_with_measurements(states_bf, states_greedy, log_determi
     print(f"Plot saved to {save_path}")
     plt.show()
 
+import csv
+import os
+from datetime import datetime
+import json
+
+class KalmanFilterLogger:
+    """Class to handle logging of Kalman Filter experiment data."""
+    
+    def __init__(self, log_file='kf_experiment_log.csv', backup_file='kf_experiment_backup.json'):
+        self.log_file = log_file
+        self.backup_file = backup_file
+        self.setup_csv_file()
+        
+    def setup_csv_file(self):
+        """Initialize the CSV file with headers if it doesn't exist."""
+        file_exists = os.path.exists(self.log_file)
+        
+        with open(self.log_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                # Write header row
+                writer.writerow([
+                    'timestamp',
+                    'iteration',
+                    'start_idx',
+                    'num_greedy_measurements',
+                    'num_optimal_measurements',
+                    'initial_optimal_log_det',
+                    'final_greedy_log_det',
+                    'final_noupdate_log_det',
+                    'final_optimal_log_det',
+                    'r_value',
+                    'start_offset'
+                ])
+    
+    def log_iteration(self, iteration, start_idx, measurement_times_greedy, 
+                     bf_result, initial_optimal_log_det, final_greedy_log_det,
+                     final_noupdate_log_det, final_optimal_log_det, 
+                     r_value, start_offset):
+        """Log data from one iteration to both CSV and JSON backup."""
+        
+        timestamp = datetime.now().isoformat()
+        
+        # Extract counts
+        num_greedy_measurements = len(measurement_times_greedy) if measurement_times_greedy else 0
+        num_optimal_measurements = len(bf_result['selected_sensors']) if bf_result and 'selected_sensors' in bf_result else 0
+        
+        # Prepare CSV row data
+        row_data = [
+            timestamp,
+            iteration,
+            start_idx,
+            num_greedy_measurements,
+            num_optimal_measurements,
+            initial_optimal_log_det,
+            final_greedy_log_det,
+            final_noupdate_log_det,
+            final_optimal_log_det,
+            r_value,
+            start_offset
+        ]
+        
+        # Write to CSV
+        try:
+            with open(self.log_file, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(row_data)
+                f.flush()  # Force write to disk
+        except Exception as e:
+            print(f"Error writing to CSV: {e}")
+        
+        # Also create a JSON backup with more detailed information
+        detailed_data = {
+            'timestamp': timestamp,
+            'iteration': iteration,
+            'start_idx': start_idx,
+            'num_greedy_measurements': num_greedy_measurements,
+            'num_optimal_measurements': num_optimal_measurements,
+            'initial_optimal_log_det': initial_optimal_log_det,
+            'final_greedy_log_det': final_greedy_log_det,
+            'final_noupdate_log_det': final_noupdate_log_det,
+            'final_optimal_log_det': final_optimal_log_det,
+            'r_value': r_value,
+            'start_offset': start_offset
+        }
+        
+        # Append to JSON backup file
+        try:
+            self.append_to_json_backup(detailed_data)
+        except Exception as e:
+            print(f"Error writing to JSON backup: {e}")
+        
+        # Print progress
+        print(f"Iteration {iteration}: Logged data for start_idx={start_idx}")
+    
+    def append_to_json_backup(self, data):
+        """Append data to JSON backup file."""
+        if os.path.exists(self.backup_file):
+            # Read existing data
+            try:
+                with open(self.backup_file, 'r') as f:
+                    existing_data = json.load(f)
+            except (json.JSONDecodeError, FileNotFoundError):
+                existing_data = []
+        else:
+            existing_data = []
+        
+        # Append new data
+        existing_data.append(data)
+        
+        # Write back to file
+        with open(self.backup_file, 'w') as f:
+            json.dump(existing_data, f, indent=2)
+
+def safe_get_value(obj, default=None):
+    """Safely get a value, returning default if there's an error."""
+    try:
+        return obj if obj is not None else default
+    except:
+        return default
+
 # main code
 if __name__ == "__main__":
     # Define file paths for GPS and IMU data
@@ -2170,44 +2291,109 @@ if __name__ == "__main__":
     # r_value = -10
     # last_time = None
 
+    # Initialize logger
+    logger = KalmanFilterLogger(log_file='kf_experiment_results.csv', 
+                               backup_file='kf_experiment_backup.json')
+
     num_off_data_points = 300
 
-    # Proxy for lower bound of R 
-    _, max_sf_KF_log_det, _, _ = sensor_fusion.run_kalman_filter_full(start_idx=0, end_idx=100000, initial_pt=pt_offset_greedy, initial_state=sf_KF_state_offset_greedy[-1], print_output=True)
+    # Your existing setup for bounds...
+    _, max_sf_KF_log_det, _, _ = sensor_fusion.run_kalman_filter_full(start_idx=0, end_idx=100000)
     lb_r_value = min(max_sf_KF_log_det)
     r_value_set = {0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8}
     print("Lower Bounded R-Value: ", lb_r_value)
 
-    for i in tqdm(range(num_off_data_points)):
-        low_end = 50
+    for i in tqdm(range(16, num_off_data_points)):
+        low_end = 25
         high_end = 2800
 
         start_idx = find_start_idx_for_time_offset(sensor_fusion, int(i * (high_end - low_end)/num_off_data_points))
-        start_offset = 100 # approximately .5 seconds
-        r_value = lb_r_value * random.sample(r_value_set, 1)
+        start_offset = 25  # approximately .5 seconds
+        r_value = lb_r_value * random.choice(list(r_value_set))  # Fixed indexing
 
         try:
             # Create an initial x^ and p for subtrajectory
-            sf_KF_state_offset_greedy, adapt_sf_KF_log_det_offset_greedy, pt_offset_greedy, _, __ = sensor_fusion.run_adaptive_threshold_kalman_filter(end_idx=start_idx, R_threshold=r_value)
+            sf_KF_state_offset_greedy, adapt_sf_KF_log_det_offset_greedy, pt_offset_greedy, _, __ = sensor_fusion.run_adaptive_threshold_kalman_filter(
+                end_idx=start_idx, R_threshold=r_value)
+
+            # FULL KF
+            max_sf_KF_state, max_sf_KF_log_det, max_sf_KF_pt, last_time_max = sensor_fusion.run_kalman_filter_full(
+                start_idx=start_idx, end_idx=start_idx + start_offset, 
+                initial_pt=pt_offset_greedy, initial_state=sf_KF_state_offset_greedy[-1], 
+                print_output=True)
         
+            r_value = (r_value / lb_r_value) * min(max_sf_KF_log_det) 
+
             # GREEDY
-            sf_KF_state_greedy, adapt_sf_KF_log_det_greedy, adapt_sf_KF_pt, last_time_greedy, measurement_times_greedy = sensor_fusion.run_adaptive_threshold_kalman_filter(start_idx=start_idx, end_idx=start_idx + start_offset, initial_pt=pt_offset_greedy, initial_state=sf_KF_state_offset_greedy[-1], R_threshold=r_value, print_output=True)
+            sf_KF_state_greedy, adapt_sf_KF_log_det_greedy, adapt_sf_KF_pt, last_time_greedy, measurement_times_greedy = sensor_fusion.run_adaptive_threshold_kalman_filter(
+                start_idx=start_idx, end_idx=start_idx + start_offset, 
+                initial_pt=pt_offset_greedy, initial_state=sf_KF_state_offset_greedy[-1], 
+                R_threshold=r_value, print_output=True)
 
             # OPTIMAL (Brute force)
-            bf_result = sensor_fusion.run_brute_force_kalman_filter_no_sampling_min_usage(start_idx=start_idx, end_idx=start_idx + start_offset, initial_pt=pt_offset_greedy, initial_state=sf_KF_state_offset_greedy[-1], R_threshold=r_value)
-
-            # FULL
-            max_sf_KF_state, max_sf_KF_log_det, max_sf_KF_pt, last_time_max = sensor_fusion.run_kalman_filter_full(start_idx=start_idx, end_idx=start_idx + start_offset, initial_pt=pt_offset_greedy, initial_state=sf_KF_state_offset_greedy[-1], print_output=True)
+            bf_result = sensor_fusion.run_brute_force_kalman_filter_no_sampling_min_usage(
+                start_idx=start_idx, end_idx=start_idx + start_offset, 
+                initial_pt=pt_offset_greedy, initial_state=sf_KF_state_offset_greedy[-1], 
+                R_threshold=r_value)
             
-            start_idx
-            len(measurement_times_greedy)
-            len(bf_result['selected_sensors'])
-            print("inital optimal", bf_result['log_determinants'][0])
-            print("final greedy", adapt_sf_KF_log_det_greedy[-1])
-            print('final no update', adapt_sf_KF_log_det_noupdate[-1])
-            print("final optimal", bf_result['log_determinants'][-1])
+            # Extract values safely
+            initial_optimal = safe_get_value(bf_result['log_determinants'][0] if bf_result else None, 'N/A')
+            final_greedy = safe_get_value(adapt_sf_KF_log_det_greedy[-1] if adapt_sf_KF_log_det_greedy else None, 'N/A')
+            
+            # Note: You have 'adapt_sf_KF_log_det_noupdate' but it's not defined in the visible code
+            # I'll assume you meant to run another method or this is from another part of your code
+            sf_KF_state_noupdate, adapt_sf_KF_log_det_noupdate, adapt_sf_KF_noupdate, last_time_noupdate, measurement_times_noupdate = sensor_fusion.run_no_update_kalman_filter(start_idx=start_idx, end_idx=start_idx + start_offset, initial_pt=pt_offset_greedy, initial_state=sf_KF_state_offset_greedy[-1], R_threshold=r_value, print_output=True)
+            final_noupdate = adapt_sf_KF_log_det_noupdate[-1]  # Replace with actual value when available
+            
+            final_optimal = safe_get_value(bf_result['log_determinants'][-1] if bf_result else None, 'N/A')
+            
+            # Log the iteration data
+            if(len(measurement_times_greedy) != 0):
+                logger.log_iteration(
+                    iteration=i,
+                    start_idx=start_idx,
+                    measurement_times_greedy=measurement_times_greedy,
+                    bf_result=bf_result,
+                    initial_optimal_log_det=initial_optimal,
+                    final_greedy_log_det=final_greedy,
+                    final_noupdate_log_det=final_noupdate,
+                    final_optimal_log_det=final_optimal,
+                    r_value=r_value,
+                    start_offset=start_offset
+                )
+            
+            # Your existing print statements
+            # print(f"start_idx: {start_idx}")
+            # print(f"len(measurement_times_greedy): {len(measurement_times_greedy) if measurement_times_greedy else 0}")
+            # print(f"len(bf_result['selected_sensors']): {len(bf_result['selected_sensors']) if bf_result and 'selected_sensors' in bf_result else 0}")
+            # print(f"initial optimal: {initial_optimal}")
+            # print(f"final greedy: {final_greedy}")
+            # print(f"final no update: {final_noupdate}")
+            # print(f"final optimal: {final_optimal}")
+            
         except Exception as e:
-            print("Skipped")
+            print(f"Iteration {i} failed with error: {e}")
+            # Log the failed iteration with error information
+            try:
+                logger.log_iteration(
+                    iteration=i,
+                    start_idx=start_idx if 'start_idx' in locals() else 'N/A',
+                    measurement_times_greedy=[],
+                    bf_result=None,
+                    initial_optimal_log_det='ERROR',
+                    final_greedy_log_det='ERROR',
+                    final_noupdate_log_det='ERROR',
+                    final_optimal_log_det='ERROR',
+                    r_value=r_value if 'r_value' in locals() else 'N/A',
+                    start_offset=start_offset if 'start_offset' in locals() else 'N/A'
+                )
+            except:
+                pass  # If even logging fails, continue
+            continue
+
+    print(f"\nExperiment completed! Results saved to:")
+    print(f"- CSV file: {logger.log_file}")
+    print(f"- JSON backup: {logger.backup_file}")
 
 
 
